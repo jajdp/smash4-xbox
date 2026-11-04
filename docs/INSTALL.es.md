@@ -38,6 +38,13 @@ mkdir $env:SMASH4_MESA\uwp -Force
 copy src\mesa_sysstubs.c, src\mesa_uwp_compat.h $env:SMASH4_MESA\uwp\
 ```
 
+Los dos se hicieron sobre estos commits, y se comprobaron con `git apply --check` contra ellos:
+
+| Árbol | Commit |
+|---|---|
+| Smash4PC | `760bd35` — *Netplay: 1080p, encoded on the GPU; keep-alive; 3DS link fails gracefully* |
+| Mesa | `a44c011` — *docs: add sha sum for 26.2.6* (26.2.x) |
+
 Si el primero no entra limpio es que el árbol de arriba se movió. Lee los hunks: la reescritura
 del renderizador está en `runtime/src/gpu/vulkan/`, la parte UWP en `runtime/src/host/`, y son
 independientes entre sí.
