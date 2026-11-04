@@ -70,7 +70,7 @@ index fab8c85..acde260 100644
        /* If we managed to load dxcompiler.dll, but either don't find
         * DxcCreateInstance, or fail to create IDxcLibrary or
 diff --git a/src/microsoft/vulkan/dzn_cmd_buffer.c b/src/microsoft/vulkan/dzn_cmd_buffer.c
-index fd85f88..0fc0bd8 100644
+index fd85f88..0e8417f 100644
 --- a/src/microsoft/vulkan/dzn_cmd_buffer.c
 +++ b/src/microsoft/vulkan/dzn_cmd_buffer.c
 @@ -1069,6 +1069,41 @@ dzn_cmd_buffer_gather_queries(struct dzn_cmd_buffer *cmdbuf)
@@ -146,11 +146,94 @@ index fd85f88..0fc0bd8 100644
        ID3D12GraphicsCommandList1_SetViewInstanceMask(cmdbuf->cmdlist, view_instance_mask);
  }
  
+@@ -3460,7 +3505,11 @@ dzn_cmd_buffer_update_viewports(struct dzn_cmd_buffer *cmdbuf)
+    const struct dzn_graphics_pipeline *pipeline =
+       (const struct dzn_graphics_pipeline *)cmdbuf->state.pipeline;
+ 
+-   if (!(cmdbuf->state.dirty & DZN_CMD_DIRTY_VIEWPORTS) ||
++   /* A belt to the braces: every path that leaves state.pipeline NULL is supposed to mark the
++    * graphics bindpoint dirty so it is rebound before we get here, but a NULL here used to be a
++    * crash rather than a missed viewport. */
++   if (!pipeline ||
++       !(cmdbuf->state.dirty & DZN_CMD_DIRTY_VIEWPORTS) ||
+        !pipeline->vp.count)
+       return;
+ 
+@@ -3473,7 +3522,7 @@ dzn_cmd_buffer_update_scissors(struct dzn_cmd_buffer *cmdbuf)
+    const struct dzn_graphics_pipeline *pipeline =
+       (const struct dzn_graphics_pipeline *)cmdbuf->state.pipeline;
+ 
+-   if (!(cmdbuf->state.dirty & DZN_CMD_DIRTY_SCISSORS))
++   if (!pipeline || !(cmdbuf->state.dirty & DZN_CMD_DIRTY_SCISSORS))
+       return;
+ 
+    if (!pipeline->scissor.count) {
+@@ -3719,6 +3768,15 @@ dzn_cmd_buffer_triangle_fan_rewrite_index(struct dzn_cmd_buffer *cmdbuf,
+       cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_COMPUTE].dirty |=
+          DZN_CMD_BINDPOINT_DIRTY_PIPELINE;
+    }
++   /* The graphics pipeline has to be rebound too, the way the blit and resolve paths below do
++    * it: SetPipelineState above replaced it, and state.pipeline is now NULL. Without this the
++    * draw that follows runs with the internal compute PSO still bound, and
++    * dzn_cmd_buffer_update_viewports(), which reads state.pipeline whenever the viewports are
++    * dirty, dereferences NULL. */
++   if (cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_GRAPHICS].pipeline) {
++      cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_GRAPHICS].dirty |=
++         DZN_CMD_BINDPOINT_DIRTY_PIPELINE;
++   }
+ 
+    cmdbuf->state.ib.view.SizeInBytes = *index_count * 4;
+    cmdbuf->state.ib.view.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(new_index_buf);
+@@ -4005,6 +4063,15 @@ dzn_cmd_buffer_patch_indirect_draw(struct dzn_cmd_buffer *cmdbuf,
+       cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_COMPUTE].dirty |=
+          DZN_CMD_BINDPOINT_DIRTY_PIPELINE;
+    }
++   /* The graphics pipeline has to be rebound too, the way the blit and resolve paths below do
++    * it: SetPipelineState above replaced it, and state.pipeline is now NULL. Without this the
++    * draw that follows runs with the internal compute PSO still bound, and
++    * dzn_cmd_buffer_update_viewports(), which reads state.pipeline whenever the viewports are
++    * dirty, dereferences NULL. */
++   if (cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_GRAPHICS].pipeline) {
++      cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_GRAPHICS].dirty |=
++         DZN_CMD_BINDPOINT_DIRTY_PIPELINE;
++   }
+ 
+    *inout_draw_buf = exec_buf;
+    *inout_draw_buf_offset = exec_buf_draw_offset;
 diff --git a/src/microsoft/vulkan/dzn_device.c b/src/microsoft/vulkan/dzn_device.c
-index 4a4dde5..fe777b5 100644
+index 4a4dde5..7503f16 100644
 --- a/src/microsoft/vulkan/dzn_device.c
 +++ b/src/microsoft/vulkan/dzn_device.c
-@@ -3330,9 +3330,14 @@ dzn_BindBufferMemory2(VkDevice _device,
+@@ -2761,8 +2761,12 @@ dzn_device_memory_create(struct dzn_device *device,
+       if (!device->dev13)
+          goto cleanup;
+ 
+-      if (FAILED(ID3D12Device13_OpenExistingHeapFromAddress1(device->dev13, host_pointer, heap_desc.SizeInBytes, &IID_ID3D12Heap, (void**)&mem->heap)))
++      HRESULT hr_open = ID3D12Device13_OpenExistingHeapFromAddress1(device->dev13, host_pointer, heap_desc.SizeInBytes, &IID_ID3D12Heap, (void**)&mem->heap);
++      if (FAILED(hr_open)) {
++         mesa_loge("dzn: OpenExistingHeapFromAddress1(%p, %llu) failed with 0x%08lx\n",
++                   host_pointer, (unsigned long long)heap_desc.SizeInBytes, (unsigned long)hr_open);
+          goto cleanup;
++      }
+ 
+       D3D12_HEAP_DESC desc = dzn_ID3D12Heap_GetDesc(mem->heap);
+       if (desc.Properties.Type != D3D12_HEAP_TYPE_CUSTOM)
+@@ -2770,8 +2774,13 @@ dzn_device_memory_create(struct dzn_device *device,
+ 
+       if ((heap_desc.Flags & ~desc.Flags) ||
+           desc.Properties.CPUPageProperty != heap_desc.Properties.CPUPageProperty ||
+-          desc.Properties.MemoryPoolPreference != heap_desc.Properties.MemoryPoolPreference)
++          desc.Properties.MemoryPoolPreference != heap_desc.Properties.MemoryPoolPreference) {
++         mesa_loge("dzn: imported heap does not match: flags 0x%x vs 0x%x, cpu page %d vs %d, pool %d vs %d\n",
++                   (unsigned)heap_desc.Flags, (unsigned)desc.Flags,
++                   (int)heap_desc.Properties.CPUPageProperty, (int)desc.Properties.CPUPageProperty,
++                   (int)heap_desc.Properties.MemoryPoolPreference, (int)desc.Properties.MemoryPoolPreference);
+          goto cleanup;
++      }
+ 
+       mem->map = host_pointer;
+       mem->res_flags = D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+@@ -3330,9 +3339,14 @@ dzn_BindBufferMemory2(VkDevice _device,
        } else {
           D3D12_RESOURCE_DESC desc = buffer->desc;
           desc.Flags |= mem->res_flags;
@@ -166,6 +249,53 @@ index 4a4dde5..fe777b5 100644
                                                         D3D12_RESOURCE_STATE_COMMON,
                                                         NULL,
                                                         &IID_ID3D12Resource,
+@@ -3878,8 +3892,44 @@ dzn_GetMemoryHostPointerPropertiesEXT(VkDevice _device,
+       return VK_ERROR_FEATURE_NOT_PRESENT;
+ 
+    ID3D12Heap *heap;
+-   if (FAILED(ID3D12Device13_OpenExistingHeapFromAddress1(device->dev13, pHostPointer, 1, &IID_ID3D12Heap, (void **)&heap)))
+-      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   /* An Xbox in developer mode answers this with a failure where a desktop succeeds, and the
++    * caller only ever sees VK_ERROR_INVALID_EXTERNAL_HANDLE. Say which HRESULT it was, and try
++    * once more over a whole 64 KiB page in case the one-byte range is what it dislikes. */
++   HRESULT hr = ID3D12Device13_OpenExistingHeapFromAddress1(device->dev13, pHostPointer, 1, &IID_ID3D12Heap, (void **)&heap);
++   if (FAILED(hr)) {
++      /* An Xbox in developer mode answers E_INVALIDARG where a desktop succeeds. Ask Windows
++       * how it sees that memory, and try the shapes the two entry points document: the whole
++       * committed region, and the older whole-allocation call. */
++      MEMORY_BASIC_INFORMATION mbi;
++      SIZE_T queried = VirtualQuery(pHostPointer, &mbi, sizeof(mbi));
++      if (queried == sizeof(mbi)) {
++         mesa_loge("dzn: host pointer %p: base %p, allocation base %p, region %llu KiB, state 0x%lx, "
++                   "protect 0x%lx, type 0x%lx\n",
++                   pHostPointer, mbi.BaseAddress, mbi.AllocationBase,
++                   (unsigned long long)(mbi.RegionSize >> 10), (unsigned long)mbi.State,
++                   (unsigned long)mbi.Protect, (unsigned long)mbi.Type);
++      } else {
++         mesa_loge("dzn: VirtualQuery(%p) returned %llu\n", pHostPointer, (unsigned long long)queried);
++         mbi.BaseAddress = (void *)pHostPointer;
++         mbi.RegionSize = 65536;
++      }
++      HRESULT hr_region = ID3D12Device13_OpenExistingHeapFromAddress1(
++         device->dev13, mbi.BaseAddress, mbi.RegionSize, &IID_ID3D12Heap, (void **)&heap);
++      HRESULT hr_old = E_NOINTERFACE;
++      if (FAILED(hr_region)) {
++         ID3D12Device3 *dev3 = NULL;
++         if (SUCCEEDED(ID3D12Device1_QueryInterface(device->dev, &IID_ID3D12Device3, (void **)&dev3))) {
++            hr_old = ID3D12Device3_OpenExistingHeapFromAddress(dev3, mbi.BaseAddress, &IID_ID3D12Heap,
++                                                               (void **)&heap);
++            ID3D12Device3_Release(dev3);
++         }
++      }
++      mesa_loge("dzn: OpenExistingHeapFromAddress1(%p, 1) 0x%08lx; whole region 0x%08lx; "
++                "OpenExistingHeapFromAddress 0x%08lx\n",
++                pHostPointer, (unsigned long)hr, (unsigned long)hr_region, (unsigned long)hr_old);
++      if (FAILED(hr_region) && FAILED(hr_old))
++         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++   }
+ 
+    struct dzn_physical_device *pdev = container_of(device->vk.physical, struct dzn_physical_device, vk);
+    D3D12_HEAP_DESC heap_desc = dzn_ID3D12Heap_GetDesc(heap);
 diff --git a/src/microsoft/vulkan/dzn_dxgi.c b/src/microsoft/vulkan/dzn_dxgi.c
 index 7dbcfa6..7335b9f 100644
 --- a/src/microsoft/vulkan/dzn_dxgi.c

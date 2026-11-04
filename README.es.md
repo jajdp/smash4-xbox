@@ -15,7 +15,7 @@ Esto es un estado honesto, no un tráiler. Las fechas son de cuando se midió ca
 |---|---|
 | **PC, Vulkan sobre una GPU NVIDIA** | **Se juega, 59,9 FPS.** Eso es Smash4PC haciendo su trabajo; el port no cambia nada aquí |
 | **PC, Vulkan sobre Direct3D 12** (Dozen, de Mesa) | **Arranca, dibuja y llega a la demo de atracción.** Lento —decenas de FPS como mucho— y a los pocos minutos se queda sin pools de descriptores y para (2026-11-04) |
-| **Xbox Series X, modo desarrollador** | **Se instala, arranca, crea su superficie Vulkan sobre la CoreWindow, sube la memoria del invitado, construye la cadena de intercambio y graba command lists.** **No** se le ha visto dibujar un fotograma en la consola todavía (2026-11-04) |
+| **Xbox Series X, modo desarrollador** | **Dibuja.** Pantalla de título, menú principal y la demo de atracción, en una televisión (2026-11-04). Con `TTT2_SUBMIT_EVERY=1`, que cuesta un envío por dibujo y lo deja en ~15 FPS; sin eso el sistema se lleva el proceso por memoria. Los menús salen con el mismo sprite repetido cuatro veces |
 
 O sea: en la consola la cadena entera está en pie y el último bloqueo conocido ya cayó, pero
 **nadie ha visto esto pintar una imagen en un televisor**. Si vienes buscando un port terminado,

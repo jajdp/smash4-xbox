@@ -101,10 +101,27 @@ index dde7a63..49ef4e3 100644
  target_sources(cafe_runtime PRIVATE ${CAFE_SHADER_OUT}/scale_comp.h)
  target_include_directories(cafe_runtime PRIVATE ${CAFE_SHADER_OUT})
 diff --git a/runtime/src/diagnostics.cpp b/runtime/src/diagnostics.cpp
-index b5cbc80..c4eb95a 100644
+index b5cbc80..736feba 100644
 --- a/runtime/src/diagnostics.cpp
 +++ b/runtime/src/diagnostics.cpp
-@@ -170,10 +170,16 @@ void fatal(const char* format, ...) {
+@@ -163,6 +163,16 @@ void fatal(const char* format, ...) {
+         print_guest_state(*t_current);
+     }
+     std::fflush(stderr);
++    // TTT2_FATAL_CRASH=1: morir de verdad, para que el sistema guarde un volcado con todos los
++    // hilos. En una consola es la unica forma de ver donde esta cada uno, y eso es lo que hace
++    // falta cuando lo que falla es que dos se esperan entre si.
++    if (const char* v = std::getenv("TTT2_FATAL_CRASH"); v != nullptr && *v == '1') {
++        // Una direccion imposible, por un puntero volatil que el compilador no puede adivinar:
++        // abort() no deja volcado en el contenedor y una escritura a nullptr se convierte en una
++        // instruccion de trampa que tampoco.
++        volatile uintptr_t donde = 0xD1ED0000u;
++        *reinterpret_cast<volatile int*>(donde) = 1;
++    }
+     // Not exit(): other guest threads still use the objects static
+     // destructors would tear down.
+     std::_Exit(70);
+@@ -170,10 +180,16 @@ void fatal(const char* format, ...) {
  
  void install_fault_handler() {
  #ifdef _WIN32
@@ -136,10 +153,18 @@ index 09fdc0f..269b987 100644
      // command processor makes the CPU see that it has (retired timestamps,
      // end-of-pipe writes).
 diff --git a/runtime/src/gpu/command_processor.cpp b/runtime/src/gpu/command_processor.cpp
-index eff48db..2c1d987 100644
+index eff48db..229dd34 100644
 --- a/runtime/src/gpu/command_processor.cpp
 +++ b/runtime/src/gpu/command_processor.cpp
-@@ -47,7 +47,13 @@ uint64_t g_submitted = 0; // under g_queue_mutex
+@@ -18,6 +18,7 @@
+ #include "cafe/guest.h"
+ #include "cafe/runtime.h"
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -47,7 +48,13 @@ uint64_t g_submitted = 0; // under g_queue_mutex
  uint64_t g_retired = 0;   // under the kernel lock
  
  std::mutex g_written_mutex;
@@ -154,7 +179,30 @@ index eff48db..2c1d987 100644
  
  std::once_flag g_started;
  std::unique_ptr<Backend> g_backend;
-@@ -200,7 +206,7 @@ void retire_later(const Retirement& r) {
+@@ -192,6 +199,22 @@ std::mutex g_retire_mutex;
+ std::condition_variable g_retire_cv;
+ std::deque<Retirement> g_retire_queue;
+ 
++// TTT2_TRACE_CP=1: cada paso del hilo que traduce, para ver donde se queda cuando se queda.
++// ⚠ Dentro de la funcion: una estatica de archivo se inicializaria al cargar el modulo, y en
++// UWP eso es antes de que uwp_entry lea entorno.txt.
++static bool trazando() {
++    static const bool si = [] {
++        const char* v = std::getenv("TTT2_TRACE_CP");
++        return v != nullptr && *v == '1';
++    }();
++    return si;
++}
++#define traza trazando()
++
++std::atomic<const char*> g_paso_cp{"sin empezar"};
++std::atomic<uint32_t> g_cmd_actual{0xFFFFFFFFu};
++std::atomic<const char*> g_paso_retiro{"sin empezar"};
++
+ void retire_later(const Retirement& r) {
+     std::lock_guard lock(g_retire_mutex);
+     g_retire_queue.push_back(r);
+@@ -200,16 +223,19 @@ void retire_later(const Retirement& r) {
  
  void retire(uint64_t timestamp);
  void retirement_main() {
@@ -163,16 +211,104 @@ index eff48db..2c1d987 100644
      for (;;) {
          Retirement r;
          {
-@@ -560,7 +566,7 @@ void retire(uint64_t timestamp) {
+             std::unique_lock lock(g_retire_mutex);
++            g_paso_retiro.store("esperando que le encolen algo", std::memory_order_relaxed);
+             g_retire_cv.wait(lock, [] { return !g_retire_queue.empty(); });
+             r = g_retire_queue.front();
+             g_retire_queue.pop_front();
+         }
++        g_paso_retiro.store("esperando a la GPU", std::memory_order_relaxed);
+         g_backend->wait_for(r.done);
++        g_paso_retiro.store("avisando al titulo", std::memory_order_relaxed);
+         g_backend->retired(r.done);
+         switch (r.kind) {
+         case Retirement::kTimestamp: retire(r.data); break;
+@@ -296,6 +322,9 @@ void advance_stream_out(uint32_t vertices) {
+ }
+ 
+ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t header_address, int depth) {
++    // El comando que se esta ejecutando, para que un fallo por espera pueda decir en cual se
++    // quedo el hilo que traduce.
++    g_cmd_actual.store(opcode, std::memory_order_relaxed);
+     const auto arg = [&](uint32_t i) { return rd32(payload + i * 4); };
+     switch (opcode) {
+     case pm4::kNop:
+@@ -407,8 +436,24 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+         const uint32_t function = arg(0) & 7;
+         if (!(arg(0) & (1u << 4))) break; // register space: nothing to wait for
+         const uint32_t target = arg(1) & ~3u;
+-        if (!compare(function, rd32(target) & arg(4), arg(3))) g_backend->idle(); // what it waits for may need it
++        if (!compare(function, rd32(target) & arg(4), arg(3))) {
++            g_backend->idle(); // what it waits for may need it
++            static uint64_t vueltas = 0;
++            if (++vueltas % 2000000 == 0) {
++                std::fprintf(stderr, "ttt2: gpu: llevo %llu vueltas esperando que 0x%08X valga 0x%08X (ahora 0x%08X)\n",
++                             static_cast<unsigned long long>(vueltas), target, arg(3), rd32(target) & arg(4));
++            }
++        }
++        g_paso_cp.store("esperando un valor en memoria (WAIT_REG_MEM)", std::memory_order_relaxed);
+         while (!compare(function, rd32(target) & arg(4), arg(3))) {
++            // ⚠ idle() EN CADA VUELTA, no solo antes de entrar. Lo que este comando espera lo
++            // escribe el hilo de retirada cuando la GPU llega a un valor, y ese valor puede ser
++            // el de una tanda que flush() prometio y todavia no ha salido. El unico que puede
++            // sacarla es este hilo, que es el que graba; dormido aqui sin llamar a idle(), los
++            // dos se esperan para siempre. (La Xbox se quedaba asi en el primer fotograma, con
++            // la GPU al dia y el titulo detras de su valla.) No cuesta nada: idle() solo hace
++            // algo si hay una tanda pendiente.
++            g_backend->idle();
+             std::this_thread::sleep_for(std::chrono::microseconds(20));
+         }
+         break;
+@@ -455,12 +500,18 @@ void execute_packet(uint32_t opcode, uint32_t payload, uint32_t count, uint32_t
+             // The title paces on flips: waiting for this frame's GPU work too
+             // missed blanks once it took most of a refresh (8 fighters at 4K).
+             // One frame in flight: ready once the one before it has finished.
++            // ⚠ El idle() va fuera del if: este valor se espera, y flush() puede devolver el de una
++            // tanda que todavia no ha salido. En el primer fotograma no hay quien la saque
++            // —`previous` es 0, asi que no se llega al idle()— y el titulo se queda esperando una
++            // valla que nunca se va a cumplir, con el hilo que traduce ya sin trabajo que pedir.
++            // Es una flip por fotograma: cerrarla de verdad no se nota.
+             static uint64_t previous = 0;
++            g_paso_cp.store("flip: cerrando el fotograma", std::memory_order_relaxed);
++            if (traza) std::fprintf(stderr, "cp: flip\n");
+             const uint64_t done = g_backend->flush();
+-            if (previous != 0) {
+-                g_backend->idle(); // (a held-back submission would never finish)
+-                g_backend->wait_for(previous);
+-            }
++            g_backend->idle(); // ⚠ SIEMPRE, no solo a partir del segundo: ver arriba
++            g_paso_cp.store("flip: esperando el fotograma anterior", std::memory_order_relaxed);
++            if (previous != 0) g_backend->wait_for(previous);
+             previous = done;
+             frame_ready();
+         }
+@@ -560,35 +611,61 @@ void retire(uint64_t timestamp) {
  }
  
  void command_processor_main() {
 -    pthread_setname_np(pthread_self(), "gpu");
 +    os::set_thread_name("gpu");
++    uint64_t vuelta = 0;
      for (;;) {
++        ++vuelta;
          Submission s;
          {
-@@ -575,12 +581,15 @@ void command_processor_main() {
+             std::unique_lock lock(g_queue_mutex);
+             if (g_queue.empty()) {
+                 lock.unlock();
++                if (traza) std::fprintf(stderr, "cp %llu: sin trabajo, vaciando lo pendiente\n",
++                                        static_cast<unsigned long long>(vuelta));
++                g_paso_cp.store("vaciando lo pendiente", std::memory_order_relaxed);
+                 g_backend->idle();
+                 lock.lock();
+             }
+-            g_queue_cv.wait(lock, [] { return !g_queue.empty(); });
++            while (!g_queue_cv.wait_for(lock, std::chrono::seconds(2), [] { return !g_queue.empty(); })) {
++                static uint32_t avisos = 0;
++                if (++avisos <= 3)
++                    std::fprintf(stderr, "ttt2: gpu: dos segundos sin que el titulo mande nada que dibujar\n");
++            }
+             s = g_queue.front();
              g_queue.pop_front();
          }
          {
@@ -188,9 +324,31 @@ index eff48db..2c1d987 100644
 +                else g_backend->guest_wrote(w.address, w.size);
 +            }
          }
++        if (traza) std::fprintf(stderr, "cp %llu: traduciendo %u palabras\n",
++                                static_cast<unsigned long long>(vuelta), s.words);
++        g_paso_cp.store("traduciendo una tanda del titulo", std::memory_order_relaxed);
          execute(s.buffer, s.words, 0);
++        if (traza) std::fprintf(stderr, "cp %llu: traducida; cerrando la tanda\n",
++                                static_cast<unsigned long long>(vuelta));
++        g_paso_cp.store("cerrando la tanda al acabar", std::memory_order_relaxed);
          retire_later({Retirement::kTimestamp, g_backend->flush(), 0, s.timestamp});
-@@ -634,7 +643,13 @@ uint64_t clock() { return cafe_ppc_timebase(); }
++        if (traza) std::fprintf(stderr, "cp %llu: cerrada\n", static_cast<unsigned long long>(vuelta));
++        g_paso_cp.store("esperando mas trabajo del titulo", std::memory_order_relaxed);
+     }
+ }
+ 
+ } // namespace
+ 
++void paso_cp(const char* paso) { g_paso_cp.store(paso, std::memory_order_relaxed); }
++void paso_retiro(const char* paso) { g_paso_retiro.store(paso, std::memory_order_relaxed); }
++const char* paso_cp() { return g_paso_cp.load(std::memory_order_relaxed); }
++const char* paso_retiro() { return g_paso_retiro.load(std::memory_order_relaxed); }
++uint32_t comando_actual() { return g_cmd_actual.load(std::memory_order_relaxed); }
++
+ void start_display();
+ 
+ void start() {
+@@ -634,7 +711,13 @@ uint64_t clock() { return cafe_ppc_timebase(); }
  void cpu_wrote(uint32_t address, uint32_t size) {
      if (size == 0) return;
      std::lock_guard lock(g_written_mutex);
@@ -206,10 +364,25 @@ index eff48db..2c1d987 100644
  
  } // namespace cafe::gpu
 diff --git a/runtime/src/gpu/gpu.h b/runtime/src/gpu/gpu.h
-index 7c1b5ee..51456dc 100644
+index 7c1b5ee..3c3c0d8 100644
 --- a/runtime/src/gpu/gpu.h
 +++ b/runtime/src/gpu/gpu.h
-@@ -69,6 +69,13 @@ bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns);
+@@ -32,6 +32,14 @@ void request_frame_trace();
+ // Starts the command processor and the display clock. Idempotent.
+ void start();
+ 
++// Donde anda cada hilo del lado de la GPU. Solo sirve para contarlo cuando algo se queda
++// esperando: `paso` apunta siempre a un literal, asi que guardarlo es una escritura y ya.
++void paso_cp(const char* paso);        // el hilo que traduce los comandos del titulo
++void paso_retiro(const char* paso);    // el que espera a la GPU y avisa al titulo
++const char* paso_cp();
++const char* paso_retiro();
++uint32_t comando_actual();   // el comando PM4 que se esta traduciendo
++
+ // ---------------------------------------------------------------- overlay
+ // Images drawn over the picture in the window's pixels (an in-game menu, a
+ // frame counter): premultiplied RGBA rows, top first, at x, y; at most two.
+@@ -69,6 +77,13 @@ bool wait_timestamp(uint64_t timestamp, uint64_t timeout_ns);
  // before the next submission executes. Any thread.
  void cpu_wrote(uint32_t address, uint32_t size);
  
@@ -224,7 +397,7 @@ index 7c1b5ee..51456dc 100644
  // ticks (so GX2GPUTimeToCPUTime is the identity).
  uint64_t clock();
 diff --git a/runtime/src/gpu/vulkan/context.cpp b/runtime/src/gpu/vulkan/context.cpp
-index 31bfd45..e804db5 100644
+index 31bfd45..4abb863 100644
 --- a/runtime/src/gpu/vulkan/context.cpp
 +++ b/runtime/src/gpu/vulkan/context.cpp
 @@ -2,6 +2,7 @@
@@ -547,14 +720,25 @@ index 31bfd45..e804db5 100644
      return b;
  }
  
-@@ -347,11 +495,21 @@ void Context::destroy_buffer(Buffer& b) {
- VkDeviceMemory Context::allocate_image_memory(VkImage image) {
+@@ -344,14 +492,31 @@ void Context::destroy_buffer(Buffer& b) {
+     b = Buffer{};
+ }
+ 
+-VkDeviceMemory Context::allocate_image_memory(VkImage image) {
++VkDeviceMemory Context::allocate_image_memory(VkImage image, const VkImageCreateInfo* ici) {
      VkMemoryRequirements req;
      vkGetImageMemoryRequirements(device, image, &req);
 +    // A driver can call a format supported and then ask for nothing to hold an image of it: Dozen
 +    // does exactly that with D32_SFLOAT as a depth target. Saying so is worth a line, because the
 +    // failure that follows reads as "out of memory" and is not.
 +    if (req.size == 0) {
++        if (ici != nullptr) {
++            fatal("Vulkan: the driver wants 0 bytes for an image: it says format %d works but cannot make "
++                  "one of %ux%u, %u levels, %u layers, usage 0x%X, type %d. See Renderer::depth_format "
++                  "for how the depth formats are checked for real.",
++                  static_cast<int>(ici->format), ici->extent.width, ici->extent.height, ici->mipLevels,
++                  ici->arrayLayers, static_cast<unsigned>(ici->usage), static_cast<int>(ici->imageType));
++        }
 +        fatal("Vulkan: the driver wants 0 bytes for an image: it says the format works but cannot "
 +              "make one. See Renderer::depth_format for the fallback.");
 +    }
@@ -570,7 +754,7 @@ index 31bfd45..e804db5 100644
      VK_CHECK(vkBindImageMemory(device, image, mem, 0));
      return mem;
  }
-@@ -366,68 +524,282 @@ void GuestMemory::init(Context& c) {
+@@ -366,68 +531,295 @@ void GuestMemory::init(Context& c) {
      // they hold every buffer the GPU reads.
      const Range ranges[] = {{layout::kMem2Base, layout::kMem2End - layout::kMem2Base},
                              {layout::kMem1Base, layout::kMem1Size}};
@@ -581,6 +765,7 @@ index 31bfd45..e804db5 100644
 +    if (const char* v = std::getenv("TTT2_GUEST_COPY"); v && std::strcmp(v, "frame") == 0) {
 +        copy_every_frame_ = true;
 +    }
++    if (const char* v = std::getenv("TTT2_TRACE_GUEST_SPAN"); v && *v == '1') trace_span_ = true;
 +    // How much of a storage buffer a shader may see. TTT2_STORAGE_BUFFER_RANGE=bytes pretends the
 +    // driver says less, to exercise the windowing on a GPU with no such limit.
 +    uint64_t cap = c.properties.limits.maxStorageBufferRange;
@@ -839,6 +1024,18 @@ index 31bfd45..e804db5 100644
 +    const uint32_t bytes = std::min<uint32_t>((end - first) << kPageShift, b.size - offset);
 +    std::memcpy(b.mapped + offset, b.host + offset, bytes);
 +    pages_copied_ += end - first;
++    // TTT2_TRACE_GUEST_SPAN: how much of a region the GPU ever reads, which is what a smaller
++    // copy would have to cover. Printed whenever that span grows past another 16 MiB.
++    if (trace_span_ && (b.base + offset < b.touched_lo || b.base + offset + bytes > b.touched_hi)) {
++        b.touched_lo = std::min(b.touched_lo, b.base + offset);
++        b.touched_hi = std::max(b.touched_hi, b.base + offset + bytes);
++        const uint32_t span = b.touched_hi - b.touched_lo;
++        if (span >= b.reported_span + (16u << 20)) {
++            b.reported_span = span & ~((16u << 20) - 1);
++            std::fprintf(stderr, "ttt2: gpu: region 0x%08X of %u MiB: the GPU has read 0x%08X-0x%08X (%u MiB)\n",
++                         b.base, b.size >> 20, b.touched_lo, b.touched_hi - 1, span >> 20);
++        }
++    }
 +}
 +
 +// The title wrote here and said so (GX2Invalidate -> Renderer::cpu_wrote): the copy is behind.
@@ -897,7 +1094,7 @@ index 31bfd45..e804db5 100644
  }
  
  // ------------------------------------------------------------ upload ring
-@@ -450,4 +822,100 @@ uint8_t* UploadRing::allocate(VkDeviceSize size, VkDeviceSize alignment, VkDevic
+@@ -450,4 +842,105 @@ uint8_t* UploadRing::allocate(VkDeviceSize size, VkDeviceSize alignment, VkDevic
      return buffer_.mapped + start;
  }
  
@@ -911,7 +1108,7 @@ index 31bfd45..e804db5 100644
 +// Sets per pool. Pools are per slot and a slot holds the draws of one submission; when one is not
 +// enough (a long submission, or sets that each take many textures) another pool joins the list,
 +// so this is a starting size and not a limit.
-+constexpr uint32_t kSetsPerPool = 256;
++constexpr uint32_t kSetsPerPool = 1024;
 +} // namespace
 +
 +VkDescriptorPool Context::create_descriptor_pool() {
@@ -969,7 +1166,12 @@ index 31bfd45..e804db5 100644
 +    ai.pSetLayouts = &set_layout;
 +    VkDescriptorSet destination = VK_NULL_HANDLE;
 +    for (uint32_t attempt = 0;; ++attempt) {
-+        if (cursor >= pools.size()) pools.push_back(create_descriptor_pool());
++        if (cursor >= pools.size()) {
++            // Se acabo el sitio: quien graba tiene que cerrar la tanda para que los sets vuelvan.
++            // Mientras tanto se hace uno nuevo, porque este dibujo ya esta a medias.
++            pools.push_back(create_descriptor_pool());
++            descriptor_pool_grew = true;
++        }
 +        ai.descriptorPool = pools[cursor];
 +        const VkResult r = vkAllocateDescriptorSets(device, &ai, &destination);
 +        if (r == VK_SUCCESS) break;
@@ -999,7 +1201,7 @@ index 31bfd45..e804db5 100644
 +
  } // namespace cafe::gpu::vk
 diff --git a/runtime/src/gpu/vulkan/context.h b/runtime/src/gpu/vulkan/context.h
-index 8397b1f..fed3d96 100644
+index 8397b1f..39ea78c 100644
 --- a/runtime/src/gpu/vulkan/context.h
 +++ b/runtime/src/gpu/vulkan/context.h
 @@ -3,15 +3,42 @@
@@ -1056,17 +1258,20 @@ index 8397b1f..fed3d96 100644
      VkDeviceSize size = 0;
  };
  
-@@ -42,6 +68,9 @@ struct Context {
+@@ -42,6 +68,12 @@ struct Context {
      uint32_t present_family = UINT32_MAX;
      VkQueue present_queue = VK_NULL_HANDLE;
      bool storage_without_format = false;
 +    // Dozen (Vulkan sobre Direct3D 12): la cadena de intercambio no admite escritura desde
 +    // un shader aunque la anuncie, y hay formatos de textura que Direct3D 12 no tiene.
 +    bool dozen = false;
++    // Un pool de descriptores se quedo sin sitio y hubo que hacer otro. Los sets no vuelven hasta
++    // que la tanda se cierra, asi que quien graba lo mira y cierra: ver Renderer::draw.
++    bool descriptor_pool_grew = false;
      VkPhysicalDeviceProperties properties{};
      VkPhysicalDeviceMemoryProperties memory{};
      bool custom_border_color = false;
-@@ -55,9 +84,42 @@ struct Context {
+@@ -55,38 +87,163 @@ struct Context {
      PFN_vkGetMemoryHostPointerPropertiesEXT get_memory_host_pointer_properties = nullptr;
      PFN_vkCmdPushDescriptorSetKHR cmd_push_descriptor_set = nullptr;
  
@@ -1109,7 +1314,10 @@ index 8397b1f..fed3d96 100644
      uint32_t memory_type(uint32_t type_bits, VkMemoryPropertyFlags flags) const;
      Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags);
      void destroy_buffer(Buffer& buffer);
-@@ -67,26 +129,114 @@ struct Context {
+-    VkDeviceMemory allocate_image_memory(VkImage image);
++    VkDeviceMemory allocate_image_memory(VkImage image, const VkImageCreateInfo* ici = nullptr);
+     VkFormatFeatureFlags format_features(VkFormat format) const {
+         VkFormatProperties p;
          vkGetPhysicalDeviceFormatProperties(physical, format, &p);
          return p.optimalTilingFeatures;
      }
@@ -1209,6 +1417,9 @@ index 8397b1f..fed3d96 100644
 +        const uint8_t* host = nullptr; // the title's own memory, where a copy reads from
 +        uint8_t* mapped = nullptr;     // the copy, where it is written (null when in place)
 +        std::vector<uint64_t> behind;  // one bit per page the copy has yet to catch up with
++        uint32_t touched_lo = 0xFFFFFFFFu; // TTT2_TRACE_GUEST_SPAN: what the GPU has ever read
++        uint32_t touched_hi = 0;
++        uint32_t reported_span = 0;
 +    };
 +    struct Window {                    // one slot of the shader's array
 +        VkBuffer buffer = VK_NULL_HANDLE;
@@ -1231,12 +1442,13 @@ index 8397b1f..fed3d96 100644
 +    std::vector<VkBuffer> buffers_;
 +    bool in_place_ = true;
 +    bool copy_every_frame_ = false;
++    bool trace_span_ = false;
 +    uint64_t pages_copied_ = 0;
 +    uint64_t whole_cache_flushes_ = 0;
  };
  
  // Host-visible memory the renderer writes per draw and per transfer
-@@ -114,7 +264,6 @@ public:
+@@ -114,7 +271,6 @@ public:
      }
      VkDeviceSize chunk_size() const { return buffer_.size / kChunks; }
      VkBuffer buffer() const { return buffer_.buffer; }
@@ -1245,7 +1457,7 @@ index 8397b1f..fed3d96 100644
  
  private:
 diff --git a/runtime/src/gpu/vulkan/draw.cpp b/runtime/src/gpu/vulkan/draw.cpp
-index d591259..ed4ceff 100644
+index d591259..05a1b3c 100644
 --- a/runtime/src/gpu/vulkan/draw.cpp
 +++ b/runtime/src/gpu/vulkan/draw.cpp
 @@ -464,6 +464,9 @@ VkPipelineLayout Renderer::pipeline_layout(uint32_t vs_textures, uint32_t ps_tex
@@ -1407,7 +1619,37 @@ index d591259..ed4ceff 100644
  }
  
  namespace {
-@@ -875,7 +947,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -724,7 +796,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     const uint32_t instances = std::max<uint32_t>(d.num_instances, 1);
+ 
+     // Primitive type: Vulkan topology, or a conversion through indices.
+-    enum class Convert { kNone, kQuads, kQuadStrip, kLoop } convert = Convert::kNone;
++    enum class Convert { kNone, kQuads, kQuadStrip, kLoop, kFan } convert = Convert::kNone;
+     VkPrimitiveTopology topology;
+     uint32_t topology_class = 2;
+     // shortcut: geometry shaders (ES -> GS -> copy shader) are not translated; the draw runs the copy shader as its
+@@ -737,7 +809,19 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+     case 0x03: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; topology_class = 1; break;
+     case 0x12: topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP; topology_class = 1; convert = Convert::kLoop; break;
+     case 0x04: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; break;
+-    case 0x05: case 0x15: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN; break;
++    case 0x05: case 0x15:
++        // Un abanico de triangulos. Dozen no lo tiene en Direct3D 12 y lo emula reescribiendo
++        // el indice con un compute shader en medio del dibujo, lo que en una Xbox deja la cola
++        // de graficos colgada (y antes del arreglo de dzn_cmd_buffer.c, con el pipeline a
++        // NULL). Generar aqui los indices sale mas barato: un dispatch y una barrera menos por
++        // dibujo. TTT2_FAN_INDICES=0 vuelve al abanico nativo, =1 lo convierte siempre.
++        if (fan_as_indices_) {
++            topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
++            convert = Convert::kFan;
++        } else {
++            topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
++        }
++        break;
+     case 0x06: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; break;
+     case 0x13: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuads; break;
+     case 0x14: topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST; convert = Convert::kQuadStrip; break;
+@@ -875,7 +959,11 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          ++deferred_draws_; // a shader still compiling
          return;
      }
@@ -1420,7 +1662,7 @@ index d591259..ed4ceff 100644
      if (pipe == nullptr) {
          report_once("draw skipped: pipeline could not be created", 0);
          ++skipped_draws_;
-@@ -927,7 +1003,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -927,7 +1015,12 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
              const uint32_t base = r(reg::VGT_STRMOUT_BUFFER_BASE_0 + i * 16) << 8;
              const uint32_t offset = r(reg::VGT_STRMOUT_BUFFER_OFFSET_0 + i * 16) * 4;
              const uint32_t size = r(reg::VGT_STRMOUT_BUFFER_SIZE_0 + i * 16) * 4;
@@ -1434,7 +1676,7 @@ index d591259..ed4ceff 100644
          }
      }
      dc.base_vertex = r(reg::SQ_VTX_BASE_VTX_LOC);
-@@ -983,7 +1064,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -983,7 +1076,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          const uint32_t type = r(reg::VGT_DMA_INDEX_TYPE);
          const bool wide = type & 1;
          const uint32_t swap = (type >> 2) & 3;
@@ -1443,7 +1685,41 @@ index d591259..ed4ceff 100644
          const uint32_t restart_index = r(reg::VGT_MULTI_PRIM_IB_RESET_INDX);
          const uint8_t* source = nullptr;
          if (d.source != Draw::kAuto) {
-@@ -1110,7 +1191,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1022,6 +1115,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         if (convert == Convert::kQuads) index_count = d.count / 4 * 6;
+         else if (convert == Convert::kQuadStrip) index_count = d.count >= 4 ? (d.count - 2) / 2 * 6 : 0;
+         else if (convert == Convert::kLoop) index_count = d.count + 1;
++        else if (convert == Convert::kFan) index_count = d.count >= 3 ? (d.count - 2) * 3 : 0;
+         if (index_count == 0) return;
+         uint32_t* out = reinterpret_cast<uint32_t*>(upload(VkDeviceSize{index_count} * 4, 4, index_offset));
+         switch (convert) {
+@@ -1066,6 +1160,25 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+             for (uint32_t i = 0; i < d.count; ++i) out[i] = index(i);
+             out[d.count] = index(0);
+             break;
++        case Convert::kFan: {
++            // (0, i, i+1) por triangulo. Un corte de primitive restart vuelve a anclar: los
++            // triangulos que entonces faltan se rellenan degenerados al final, para que el
++            // numero de indices sea el que ya se reservo.
++            uint32_t anchor = 0xFFFFFFFFu, prev = 0xFFFFFFFFu, t = 0;
++            for (uint32_t i = 0; i < d.count; ++i) {
++                const uint32_t v = index(i);
++                if (v == 0xFFFFFFFFu) { anchor = prev = 0xFFFFFFFFu; continue; }
++                if (anchor == 0xFFFFFFFFu) { anchor = v; continue; }
++                if (prev == 0xFFFFFFFFu) { prev = v; continue; }
++                out[t * 3 + 0] = anchor;
++                out[t * 3 + 1] = prev;
++                out[t * 3 + 2] = v;
++                prev = v;
++                ++t;
++            }
++            for (; t < index_count / 3; ++t) out[t * 3 + 0] = out[t * 3 + 1] = out[t * 3 + 2] = 0;
++            break;
++        }
+         }
+     }
+ 
+@@ -1110,7 +1223,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          info.pColorAttachments = ca;
          info.pDepthAttachment = depth ? &da : nullptr;
          info.pStencilAttachment = depth && has_stencil(depth->image.format) ? &da : nullptr;
@@ -1452,7 +1728,7 @@ index d591259..ed4ceff 100644
          rendering_ = true;
          pass_colors_ = colors;
          pass_depth_ = depth;
-@@ -1127,7 +1208,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1127,7 +1240,7 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      std::vector<VkWriteDescriptorSet> writes;
      VkDescriptorBufferInfo buffers[3];
      VkDescriptorImageInfo images[2 * abi::kTextureSlots];
@@ -1461,7 +1737,7 @@ index d591259..ed4ceff 100644
      const auto write_buffer = [&](uint32_t binding, VkDeviceSize offset, VkDeviceSize range) {
          VkDescriptorBufferInfo& b = buffers[writes.size()];
          b = {ring_.buffer(), offset, range};
-@@ -1139,6 +1220,24 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1139,6 +1252,24 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          writes.push_back(w);
      };
      write_buffer(abi::kDrawConstantsBinding, dc_offset, sizeof(dc));
@@ -1486,7 +1762,7 @@ index d591259..ed4ceff 100644
      if (vs->info.uses_registers) write_buffer(abi::kVsRegistersBinding, reg_offset[0], 4096);
      if (ps->info.uses_registers) write_buffer(abi::kPsRegistersBinding, reg_offset[1], 4096);
      uint32_t image_count = 0;
-@@ -1157,8 +1256,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1157,8 +1288,10 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      };
      write_textures(vs, vs_textures, abi::kVsTextureBinding);
      write_textures(ps, ps_textures, abi::kPsTextureBinding);
@@ -1499,7 +1775,7 @@ index d591259..ed4ceff 100644
  
      // Viewport: the Latte transform as is (negative heights flip y).
      const float xscale = std::bit_cast<float>(r(reg::PA_CL_VPORT_XSCALE_0));
-@@ -1206,19 +1307,26 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1206,19 +1339,26 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
      vkCmdSetScissor(c, 0, 1, &scissor);
  
      const uint32_t mode = r(reg::PA_SU_SC_MODE_CNTL);
@@ -1537,7 +1813,7 @@ index d591259..ed4ceff 100644
      if (offset_enable) {
          const float scale = std::bit_cast<float>(r(reg::PA_SU_POLY_OFFSET_FRONT_SCALE));
          const float offset = std::bit_cast<float>(r(reg::PA_SU_POLY_OFFSET_FRONT_SCALE + 4));
-@@ -1243,27 +1351,34 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+@@ -1243,27 +1383,34 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
          no_depth = range && count >= std::strtoul(range, nullptr, 10) &&
                     count <= std::strtoul(std::strchr(range, ',') + 1, nullptr, 10);
      }
@@ -1585,8 +1861,42 @@ index d591259..ed4ceff 100644
      }
      const uint32_t ref = r(reg::DB_STENCILREFMASK), ref_bf = backface ? r(reg::DB_STENCILREFMASK_BF) : ref;
      vkCmdSetStencilReference(c, VK_STENCIL_FACE_FRONT_BIT, ref & 0xFF);
+@@ -1328,6 +1475,33 @@ void Renderer::draw(const Registers& regs, const Draw& d) {
+         vkCmdDraw(c, d.count, instances, 0, 0);
+     }
+     if (writes_stream_out) stream_out_pending_ = true;
++    // TTT2_SUBMIT_EVERY=1: cerrar y esperar a la GPU despues de CADA dibujo. Solo para cazar el
++    // dibujo que cuelga una GPU: la espera que falle dira cuantos dibujos iban.
++    // Cerrar la tanda cuando los descriptores se han quedado sin sitio: es lo unico que los
++    // devuelve, y sin esto el pool crece sin freno hasta que el sistema se lleva el proceso.
++    if (ctx_.descriptor_pool_grew) {
++        ctx_.descriptor_pool_grew = false;
++        static uint64_t veces = 0;
++        if (++veces <= 3) {
++            std::fprintf(stderr, "ttt2: gpu: sin sitio en el pool de descriptores; cierro la tanda\n");
++        }
++        submit(false);
++        since_submit_ = 0;
++    }
++    if (submit_every_ != 0 && ++since_submit_ >= submit_every_) {
++        since_submit_ = 0;
++        if (submit_every_ == 1) {
++            std::fprintf(stderr, "ttt2: gpu: dibujo %llu: %u indices, topologia %d, %u instancias\n",
++                         static_cast<unsigned long long>(draws_), indexed ? index_count : d.count,
++                         static_cast<int>(topology), instances);
++        }
++        // ⚠ Con espera. Sin ella, el CPU sigue copiando paginas del espejo de la memoria del
++        // invitado —que es memoria que la GPU lee directamente— mientras la GPU todavia esta
++        // con el dibujo anterior, y lo que se dibuja sale con datos de dos fotogramas a la vez:
++        // estelas en los menus y geometria que no aparece. En una maquina rapida no se ve
++        // porque la GPU acaba antes de que lleguen las copias; en la consola, se ve.
++        submit(false);
++    }
+     // TTT2_TRACE_DRAWS=first,last: the traced frame's color target after each of those draws (from 1), as PNGs.
+     if (tracing()) {
+         static uint64_t frame = UINT64_MAX;
 diff --git a/runtime/src/gpu/vulkan/formats.cpp b/runtime/src/gpu/vulkan/formats.cpp
-index 9911027..aa9755f 100644
+index 9911027..9c225bb 100644
 --- a/runtime/src/gpu/vulkan/formats.cpp
 +++ b/runtime/src/gpu/vulkan/formats.cpp
 @@ -1,6 +1,9 @@
@@ -1599,10 +1909,11 @@ index 9911027..aa9755f 100644
  #include "gx2/types.h"
  
  namespace cafe::gpu::vk {
-@@ -9,9 +12,17 @@ namespace {
+@@ -9,9 +12,18 @@ namespace {
  using namespace latte;
  
  bool g_a4b4g4r4 = false;
++bool g_r4g4b4a4 = false;
 +bool g_r4g4 = false;
 +bool g_b5g6r5 = false;
 +bool g_r8_srgb = false;
@@ -1617,7 +1928,7 @@ index 9911027..aa9755f 100644
  
  constexpr VkComponentSwizzle R = VK_COMPONENT_SWIZZLE_R, G = VK_COMPONENT_SWIZZLE_G, B = VK_COMPONENT_SWIZZLE_B,
                               A = VK_COMPONENT_SWIZZLE_A, I = VK_COMPONENT_SWIZZLE_IDENTITY;
-@@ -35,6 +46,35 @@ VkFormat by_type(uint32_t type, VkFormat unorm, VkFormat uint, VkFormat snorm, V
+@@ -35,15 +47,116 @@ VkFormat by_type(uint32_t type, VkFormat unorm, VkFormat uint, VkFormat snorm, V
  
  } // namespace
  
@@ -1653,7 +1964,14 @@ index 9911027..aa9755f 100644
  void init_formats(VkPhysicalDevice physical) {
      const VkFormatFeatureFlags sampled = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
      g_a4b4g4r4 = supported(physical, VK_FORMAT_A4B4G4R4_UNORM_PACK16, sampled);
-@@ -44,6 +84,70 @@ void init_formats(VkPhysicalDevice physical) {
++    g_r4g4b4a4 = supported(physical, VK_FORMAT_R4G4B4A4_UNORM_PACK16, sampled);
++    // TTT2_NO_4444=1: fingir que no esta ninguno de los dos, que es lo que pasa en la consola.
++    if (const char* v = std::getenv("TTT2_NO_4444"); v != nullptr && *v == '1') {
++        g_a4b4g4r4 = g_r4g4b4a4 = false;
++    }
+     g_a1b5g5r5 = supported(physical, VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR, sampled);
+     g_rgba16_snorm = supported(physical, VK_FORMAT_R16G16B16A16_SNORM,
+                                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT |
                                     VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
      g_d24s8 = supported(physical, VK_FORMAT_D24_UNORM_S8_UINT,
                          VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT);
@@ -1719,12 +2037,15 @@ index 9911027..aa9755f 100644
 +    g_d32s8 = depth_usable(physical, device, VK_FORMAT_D32_SFLOAT_S8_UINT);
 +    g_d24s8 = depth_usable(physical, device, VK_FORMAT_D24_UNORM_S8_UINT);
 +    g_d16 = depth_usable(physical, device, VK_FORMAT_D16_UNORM);
++    // TTT2_NO_D16=1: fingir que el driver no sabe hacer imagenes D16, que es lo que pasa en
++    // una Xbox. Sirve para reproducir en el PC lo que alli se ve.
++    if (const char* v = std::getenv("TTT2_NO_D16"); v != nullptr && *v == '1') g_d16 = false;
 +    std::fprintf(stderr, "ttt2: GPU: profundidad utilizable de verdad: D16 %s, D32 %s, D24S8 %s, D32S8 %s\n",
 +                 g_d16 ? "si" : "no", g_d32 ? "si" : "no", g_d24s8 ? "si" : "no", g_d32s8 ? "si" : "no");
  }
  
  FormatInfo color_format(uint32_t gx2_format) {
-@@ -54,12 +158,20 @@ FormatInfo color_format(uint32_t gx2_format) {
+@@ -54,12 +167,20 @@ FormatInfo color_format(uint32_t gx2_format) {
      const bool is_float = type == gx2::surface_format::kTypeFloat;
      switch (hw) {
      case fmt::k8:
@@ -1748,7 +2069,7 @@ index 9911027..aa9755f 100644
          f.bytes = 1;
          break;
      case fmt::k16:
-@@ -71,10 +183,19 @@ FormatInfo color_format(uint32_t gx2_format) {
+@@ -71,10 +192,19 @@ FormatInfo color_format(uint32_t gx2_format) {
      case fmt::k16Float: f.format = VK_FORMAT_R16_SFLOAT; f.bytes = 2; break;
      case fmt::k8_8:
          f.format = by_type(type, VK_FORMAT_R8G8_UNORM, VK_FORMAT_R8G8_UINT, VK_FORMAT_R8G8_SNORM, VK_FORMAT_R8G8_SINT,
@@ -1770,7 +2091,24 @@ index 9911027..aa9755f 100644
      case fmt::k1_5_5_5: // R5_G5_B5_A1: R in bits 0-4, A in bit 15
          if (g_a1b5g5r5) {
              f.format = VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR;
-@@ -117,7 +238,7 @@ FormatInfo color_format(uint32_t gx2_format) {
+@@ -87,9 +217,15 @@ FormatInfo color_format(uint32_t gx2_format) {
+     case fmt::k4_4_4_4: // R in bits 0-3
+         if (g_a4b4g4r4) {
+             f.format = VK_FORMAT_A4B4G4R4_UNORM_PACK16;
+-        } else {
++        } else if (g_r4g4b4a4) {
+             f.format = VK_FORMAT_R4G4B4A4_UNORM_PACK16;
+             f.swizzle = {A, B, G, R};
++        } else {
++            // Ninguno de los dos: a ocho bits por canal al subir. Sin esto se creaba una imagen
++            // de un formato que el driver no tiene, y lo que se dibujaba con ella no era lo que
++            // el titulo puso: una Xbox no tiene ni R4G4B4A4 ni A4B4G4R4.
++            f.format = VK_FORMAT_R8G8B8A8_UNORM;
++            f.unpack = Unpack::kRgba4444;
+         }
+         f.bytes = 2;
+         break;
+@@ -117,7 +253,7 @@ FormatInfo color_format(uint32_t gx2_format) {
          // to 0 (Smash's lighting buffers hold signed data).
          if (type == gx2::surface_format::kTypeSnorm && g_rgba16_snorm) {
              f.format = VK_FORMAT_R16G16B16A16_SNORM;
@@ -1779,7 +2117,22 @@ index 9911027..aa9755f 100644
          }
          break;
      case fmt::k8_8_8_8:
-@@ -193,18 +314,21 @@ FormatInfo depth_format(uint32_t gx2_format) {
+@@ -188,23 +324,35 @@ FormatInfo depth_format(uint32_t gx2_format) {
+     f.swizzle = {I, I, I, I};
+     switch (gx2_format) {
+     case gx2::surface_format::kUnormR16:
+-        f.format = VK_FORMAT_D16_UNORM;
++        // Como los de abajo: una Xbox declara D16 y luego pide cero bytes para una imagen de
++        // ese formato. Era el unico caso que no miraba si el driver sabe hacerla, y el juego
++        // moria al llegar al primer mapa de sombras.
++        // El orden no es casual: sin D16, se prefiere un formato de profundidad EN FLOAT, porque
++        // al copiarlo sale un float por pixel y de ahi se puede convertir a lo que el titulo
++        // espera con un blit (ver Renderer::copy_depth_to_texture). D24S8 se copiaria como 24
++        // bits metidos en 32, que no es un numero que nadie sepa convertir.
++        f.format = g_d16 ? VK_FORMAT_D16_UNORM
++                         : (g_d32 ? VK_FORMAT_D32_SFLOAT
++                                  : (g_d32s8 ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D24_UNORM_S8_UINT));
+         f.bytes = 2;
          f.aspect = VK_IMAGE_ASPECT_DEPTH_BIT;
          break;
      case gx2::surface_format::kUnormR24X8:
@@ -1805,10 +2158,10 @@ index 9911027..aa9755f 100644
          f.aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
          break;
 diff --git a/runtime/src/gpu/vulkan/formats.h b/runtime/src/gpu/vulkan/formats.h
-index 4956d02..513c000 100644
+index 4956d02..3ff26e0 100644
 --- a/runtime/src/gpu/vulkan/formats.h
 +++ b/runtime/src/gpu/vulkan/formats.h
-@@ -14,20 +14,31 @@
+@@ -14,20 +14,32 @@
  
  namespace cafe::gpu::vk {
  
@@ -1819,6 +2172,7 @@ index 4956d02..513c000 100644
 +    kSnorm1010102,  // 10_10_10_2 con signo -> R16G16B16A16_SNORM (Vulkan no tiene 10 bits con signo)
 +    kNibbles44,     // 4_4 -> R8G8_UNORM
 +    kRgb565,        // 5_6_5 -> R8G8B8A8_UNORM
++    kRgba4444,      // 4_4_4_4 -> R8G8B8A8_UNORM
 +};
 +
  struct FormatInfo {
@@ -1896,15 +2250,16 @@ index 622a213..ee54531 100644
  }
  
 diff --git a/runtime/src/gpu/vulkan/present.cpp b/runtime/src/gpu/vulkan/present.cpp
-index 0778742..3a2e744 100644
+index 0778742..207ee7a 100644
 --- a/runtime/src/gpu/vulkan/present.cpp
 +++ b/runtime/src/gpu/vulkan/present.cpp
-@@ -26,14 +26,13 @@
- // to a blit on the rendering queue (queue_mutex_ serialises its use).
+@@ -27,13 +27,14 @@
  
  #include "gpu/vulkan/renderer.h"
-+#include "os/kernel.h" // os::set_thread_name
  
++#include "gpu/gpu.h"
++#include "os/kernel.h" // os::set_thread_name
++
  #include "gpu/gpu.h"
  #include "host/window.h"
  
@@ -1915,7 +2270,7 @@ index 0778742..3a2e744 100644
  #include <algorithm>
  #include <chrono>
  #include <cmath>
-@@ -136,7 +135,11 @@ void Renderer::start_presenter() {
+@@ -136,7 +137,11 @@ void Renderer::start_presenter() {
      VkSurfaceCapabilitiesKHR caps;
      VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(ctx_.physical, surface_, &caps));
      compute_present_ = supported && ctx_.storage_without_format && (caps.supportedUsageFlags & VK_IMAGE_USAGE_STORAGE_BIT) &&
@@ -1928,7 +2283,7 @@ index 0778742..3a2e744 100644
      // Whether the surface tells when presents reach the screen (needed to
      // present every refresh; the mode itself is chosen by the presentation
      // thread, for the display the window is on).
-@@ -167,7 +170,8 @@ void Renderer::start_presenter() {
+@@ -167,7 +172,8 @@ void Renderer::start_presenter() {
          bindings[1] = {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
          bindings[2] = {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
          VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -1938,7 +2293,7 @@ index 0778742..3a2e744 100644
          dli.bindingCount = 3;
          dli.pBindings = bindings;
          VkDescriptorSetLayout set_layout;
-@@ -179,6 +183,7 @@ void Renderer::start_presenter() {
+@@ -179,6 +185,7 @@ void Renderer::start_presenter() {
          pli.pushConstantRangeCount = 1;
          pli.pPushConstantRanges = &range;
          VK_CHECK(vkCreatePipelineLayout(ctx_.device, &pli, nullptr, &scale_layout_));
@@ -1946,7 +2301,30 @@ index 0778742..3a2e744 100644
          VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
          cpi.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, module, "main",
                       nullptr};
-@@ -481,7 +486,7 @@ void Renderer::choose_presentation(double hz) {
+@@ -245,7 +252,21 @@ uint32_t Renderer::take_present_image() {
+         stolen_images_.fetch_add(1, std::memory_order_relaxed);
+         return i;
+     }
+-    present_cv_.wait(lock, free);
++    // ⚠ Con plazo. Sin el, si las imagenes las tiene todas el presentador y el presentador
++    // espera a la GPU, este hilo —el unico que puede cerrar la tanda que la GPU necesita— se
++    // queda aqui para siempre. Con plazo, al menos se sabe y se puede cerrar lo pendiente.
++    gpu::paso_cp("esperando una imagen de presentacion libre");
++    while (!present_cv_.wait_for(lock, std::chrono::milliseconds(200), free)) {
++        static uint64_t avisos = 0;
++        if (++avisos <= 3) {
++            std::fprintf(stderr, "ttt2: gpu: no hay imagen de presentacion libre y la cola esta vacia; "
++                                 "cierro lo que haya grabado por si la espera depende de ello\n");
++        }
++        lock.unlock();
++        idle();
++        lock.lock();
++    }
++    gpu::paso_cp("traduciendo una tanda del titulo");
+     const uint32_t i = static_cast<uint32_t>(std::find(present_free_.begin(), present_free_.end(), 1) - present_free_.begin());
+     present_free_[i] = 0;
+     return i;
+@@ -481,7 +502,7 @@ void Renderer::choose_presentation(double hz) {
  }
  
  void Renderer::presenter_main() {
@@ -1955,7 +2333,7 @@ index 0778742..3a2e744 100644
      // The mode follows the window's display: chosen again when the window
      // moves to another display or its mode changes, or when the display
      // turns out to refresh at another rate than reported.
-@@ -1032,7 +1037,7 @@ bool Renderer::present_image(uint32_t i, uint64_t ready, uint64_t present_id) {
+@@ -1032,7 +1053,7 @@ bool Renderer::present_image(uint32_t i, uint64_t ready, uint64_t present_id) {
          VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
          di.imageMemoryBarrierCount = 1;
          di.pImageMemoryBarriers = &ib;
@@ -1964,7 +2342,7 @@ index 0778742..3a2e744 100644
      };
      // Letterboxed to the TV image's aspect ratio. A window within 2 pixels of
      // the image shows it 1:1, centred, those pixels cut off or left black: at
-@@ -1066,7 +1071,13 @@ bool Renderer::present_image(uint32_t i, uint64_t ready, uint64_t present_id) {
+@@ -1066,7 +1087,13 @@ bool Renderer::present_image(uint32_t i, uint64_t ready, uint64_t present_id) {
          writes[2].descriptorCount = 1;
          writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
          writes[2].pBufferInfo = &overlay;
@@ -1980,10 +2358,19 @@ index 0778742..3a2e744 100644
          const int32_t rect[6] = {x, y, w, h, extent_w, extent_h};
          vkCmdPushConstants(present_cmd_, scale_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof rect, rect);
 diff --git a/runtime/src/gpu/vulkan/renderer.cpp b/runtime/src/gpu/vulkan/renderer.cpp
-index 87561f3..388b015 100644
+index 87561f3..e66d330 100644
 --- a/runtime/src/gpu/vulkan/renderer.cpp
 +++ b/runtime/src/gpu/vulkan/renderer.cpp
-@@ -56,6 +56,9 @@ constexpr VkDeviceSize kRingSize = 256ull << 20;
+@@ -3,6 +3,8 @@
+ 
+ #include "gpu/vulkan/renderer.h"
+ 
++#include "gpu/gpu.h"
++
+ #include "gpu/vulkan/png.h"
+ #include "host/display_settings.h"
+ #include "host/window.h"
+@@ -56,6 +58,9 @@ constexpr VkDeviceSize kRingSize = 256ull << 20;
  Renderer::Renderer() {
      ctx_.init(host::vulkan_instance_extensions());
      init_formats(ctx_.physical);
@@ -1993,7 +2380,27 @@ index 87561f3..388b015 100644
      guest_.init(ctx_);
      ring_.init(ctx_, kRingSize);
      VkSemaphoreCreateInfo sci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-@@ -120,13 +123,17 @@ VkCommandBuffer Renderer::cmd() {
+@@ -82,6 +87,19 @@ Renderer::Renderer() {
+     qci.queryCount = 2 * kSlots;
+     VK_CHECK(vkCreateQueryPool(ctx_.device, &qci, nullptr, &busy_pool_));
+ 
++    // Los abanicos de triangulos, por indices propios en vez de la emulacion de Dozen: ver
++    // el porque en draw.cpp, donde se generan.
++    fan_as_indices_ = ctx_.dozen;
++    // TTT2_SUBMIT_EVERY=N: cerrar la tanda cada N dibujos. En la Xbox, una tanda sin limite deja
++    // a la GPU sin terminar nunca (vkWaitSemaphores agota su plazo y no hay dibujo que lo explique:
++    // con N=1 se dibujan miles sin una queja). Es la medida, no el diagnostico: el numero mas alto
++    // que aguanta dice que es lo que se agota.
++    if (const char* v = std::getenv("TTT2_SUBMIT_EVERY"); v != nullptr && *v != 0)
++        submit_every_ = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
++    if (submit_every_ != 0)
++        std::fprintf(stderr, "ttt2: GPU: una tanda cada %u dibujos\n", submit_every_);
++    if (const char* v = std::getenv("TTT2_FAN_INDICES"); v && *v) fan_as_indices_ = *v == '1';
++    if (fan_as_indices_) std::fprintf(stderr, "ttt2: GPU: los abanicos de triangulos se dibujan por indices\n");
+     if (const char* f = std::getenv("TTT2_TRACE_FRAME")) trace_frame_ = std::strtoull(f, nullptr, 10);
+     // Render scale: the run's (display.ini's resolution or TTT2_SCALE, set
+     // by the window), else enough to cover the display (2 on 1080p and
+@@ -120,18 +138,47 @@ VkCommandBuffer Renderer::cmd() {
                  busy_seconds_ += (ts[1] - ts[0]) * ctx_.properties.limits.timestampPeriod * 1e-9;
              }
          }
@@ -2012,7 +2419,65 @@ index 87561f3..388b015 100644
      }
      return cmd_;
  }
-@@ -151,7 +158,7 @@ uint64_t Renderer::submit(bool wait) {
+ 
++// TTT2_GPU_TIMEOUT=segundos. Diez segundos es «la GPU se colgo» en cualquier maquina sana, pero
++// distingue mal un cuelgue de una lentitud absurda: subirlo es la forma barata de saber cual de
++// las dos cosas es.
++static uint64_t gpu_timeout_ns() {
++    static const uint64_t limit = [] {
++        const char* v = std::getenv("TTT2_GPU_TIMEOUT");
++        const double s = v != nullptr && *v != 0 ? std::strtod(v, nullptr) : 10.0;
++        return static_cast<uint64_t>((s > 0 ? s : 10.0) * 1e9);
++    }();
++    return limit;
++}
++
+ void Renderer::wait_value(uint64_t value, int why) {
++    // ⚠ Lo que se espera puede ser una tanda que flush() prometio y que nadie ha enviado todavia.
++    // El unico que puede enviarla es el hilo que graba, que es este, asi que si no se cierra aqui
++    // no se cierra nunca: el anillo de subida espera sitio, el sitio espera a la GPU, y la GPU
++    // espera una tanda que sigue en este hilo. (En la consola el arranque se quedaba asi, con la
++    // GPU al dia y el titulo detras de su valla.)
++    if (value > submitted_ && flush_pending_) {
++        static uint64_t rescatadas = 0;
++        if (++rescatadas <= 3) {
++            std::fprintf(stderr, "ttt2: gpu: la tanda %llu se esperaba a si misma; cerrada aqui\n",
++                         static_cast<unsigned long long>(value));
++        }
++        submit(false);
++    }
+     uint64_t done = 0;
+     VK_CHECK(vkGetSemaphoreCounterValue(ctx_.device, timeline_, &done));
+     if (done >= value) return;
+@@ -140,18 +187,33 @@ void Renderer::wait_value(uint64_t value, int why) {
+     wi.semaphoreCount = 1;
+     wi.pSemaphores = &timeline_;
+     wi.pValues = &value;
+-    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull);
+-    if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
++    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, gpu_timeout_ns());
++    if (r != VK_SUCCESS) {
++        uint64_t reached = 0;
++        const VkResult q = vkGetSemaphoreCounterValue(ctx_.device, timeline_, &reached);
++        fatal("Vulkan: the GPU did not finish a submission (%d): %.1f s waiting for %llu, it is at %llu (%d); "
++              "%llu draws, %llu skipped, %llu frames",
++              static_cast<int>(r), now_seconds() - begin, static_cast<unsigned long long>(value),
++              static_cast<unsigned long long>(reached), static_cast<int>(q),
++              static_cast<unsigned long long>(draws_), static_cast<unsigned long long>(skipped_draws_),
++              static_cast<unsigned long long>(frames_));
++        (void)gpu::paso_cp();
++    }
+     wait_seconds_ += now_seconds() - begin;
+     ++waits_;
+     ++waits_by_[why];
+ }
+ 
+ uint64_t Renderer::submit(bool wait) {
++    // Una promesa es una promesa. flush() devolvio submitted_ + 1 a alguien que va a esperar ese
++    // valor; si al cerrar no hay nada grabado, submitted_ no sube y ese alguien espera para
++    // siempre. Abrir una tanda vacia cuesta un vkQueueSubmit y lo cumple. (Visto en la Xbox: el
++    // hilo de retirada esperando el 20 con la GPU al dia en 19 de 19, y el titulo detras de el.)
++    if (!recording_ && flush_pending_) cmd();
      if (recording_) {
          end_rendering();
          copy_write_backs();
@@ -2021,7 +2486,55 @@ index 87561f3..388b015 100644
          VK_CHECK(vkEndCommandBuffer(cmd_));
          const uint64_t value = ++submitted_;
          VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
-@@ -220,7 +227,7 @@ void Renderer::barrier() {
+@@ -195,6 +257,7 @@ uint64_t Renderer::flush() {
+ }
+ 
+ void Renderer::idle() {
++    ++idle_calls_;
+     if (flush_pending_) submit(false);
+ }
+ 
+@@ -204,8 +267,37 @@ void Renderer::wait_for(uint64_t value) {
+     wi.semaphoreCount = 1;
+     wi.pSemaphores = &timeline_;
+     wi.pValues = &value;
+-    const VkResult r = vkWaitSemaphores(ctx_.device, &wi, 10'000'000'000ull);
+-    if (r != VK_SUCCESS) fatal("Vulkan: the GPU did not finish a submission (%d)", static_cast<int>(r));
++    // Por tramos, y en cada uno el rescate de la tanda prometida: flush() devuelve el valor que
++    // tendra la tanda que se esta grabando, sin enviarla, contando con que el hilo que la graba
++    // la cierre enseguida. Si ese hilo se queda esperando algo que depende de este mismo valor,
++    // se esperan el uno al otro. A los 50 ms sin un solo envio el grabador no esta grabando: la
++    // saca quien la espera. (La Xbox lo encontro en el primer fotograma, con la GPU al dia y el
++    // titulo detras de su valla; en el PC no se llega a ver porque siempre hay otro fotograma
++    // empujando por detras.)
++    const double empezo = now_seconds();
++    VkResult r = VK_TIMEOUT;
++    while ((r = vkWaitSemaphores(ctx_.device, &wi, 100'000'000ull)) == VK_TIMEOUT) {
++        // ⚠ Aqui NO se puede cerrar la tanda: este no es el hilo que graba, y vkEndCommandBuffer
++        // sobre un command buffer que el otro esta escribiendo se lleva el proceso por delante
++        // (probado: muere sin excepcion, antes incluso del aviso). Quien la cierre tiene que ser
++        // el que la graba.
++        if ((now_seconds() - empezo) * 1e9 > static_cast<double>(gpu_timeout_ns())) break;
++    }
++    if (r != VK_SUCCESS)
++    {
++        uint64_t reached = 0;
++        vkGetSemaphoreCounterValue(ctx_.device, timeline_, &reached);
++        fatal("Vulkan: the GPU did not finish a submission (%d) waiting from the retirement thread for %llu: "
++              "it is at %llu of %llu sent; %llu draws, %llu skipped; recording %d, flush pending %d, "
++              "%.1f s since the last submission, %llu idle calls; el hilo que traduce esta en «%s», "
++              "el de retirada en «%s»; comando PM4 0x%02X",
++              static_cast<int>(r), static_cast<unsigned long long>(value),
++              static_cast<unsigned long long>(reached), static_cast<unsigned long long>(submitted_),
++              static_cast<unsigned long long>(draws_), static_cast<unsigned long long>(skipped_draws_),
++              recording_ ? 1 : 0, flush_pending_ ? 1 : 0, now_seconds() - last_submit_,
++              static_cast<unsigned long long>(idle_calls_), gpu::paso_cp(), gpu::paso_retiro(),
++              gpu::comando_actual());
++    }
+ }
+ 
+ void Renderer::sync() { submit(true); }
+@@ -220,7 +312,7 @@ void Renderer::barrier() {
      VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
      di.memoryBarrierCount = 1;
      di.pMemoryBarriers = &mb;
@@ -2030,7 +2543,7 @@ index 87561f3..388b015 100644
  }
  
  uint8_t* Renderer::upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset) {
-@@ -260,7 +267,7 @@ uint8_t* Renderer::upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSiz
+@@ -260,7 +352,7 @@ uint8_t* Renderer::upload(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSiz
  
  void Renderer::end_rendering() {
      if (!rendering_) return;
@@ -2039,7 +2552,26 @@ index 87561f3..388b015 100644
      rendering_ = false;
      bound_pipeline_ = nullptr;
      barrier();
-@@ -323,7 +330,7 @@ Image Renderer::create_image(VkFormat format, VkImageAspectFlags aspect, uint32_
+@@ -300,7 +392,7 @@ Image Renderer::create_image(VkFormat format, VkImageAspectFlags aspect, uint32_
+         ici.pQueueFamilyIndices = families;
+     }
+     VK_CHECK(vkCreateImage(ctx_.device, &ici, nullptr, &img.image));
+-    img.memory = ctx_.allocate_image_memory(img.image);
++    img.memory = ctx_.allocate_image_memory(img.image, &ici);
+ 
+     VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+     vci.image = img.image;
+@@ -319,11 +411,17 @@ Image Renderer::create_image(VkFormat format, VkImageAspectFlags aspect, uint32_
+     ib.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+     ib.srcQueueFamilyIndex = ib.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+     ib.image = img.image;
++    // ⚠ Los dos planos, no solo el de la vista: un formato con plantilla que se coloca a medias
++    // deja el otro plano en UNDEFINED, y el adjunto de profundidad-plantilla los quiere ambos.
+     ib.subresourceRange = vci.subresourceRange;
++    if (format == VK_FORMAT_D24_UNORM_S8_UINT || format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
++        format == VK_FORMAT_D16_UNORM_S8_UINT) {
++        ib.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++    }
      VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
      di.imageMemoryBarrierCount = 1;
      di.pImageMemoryBarriers = &ib;
@@ -2048,7 +2580,7 @@ index 87561f3..388b015 100644
      return img;
  }
  
-@@ -399,7 +406,12 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
+@@ -399,7 +497,12 @@ void Renderer::save_image(const Image& img, const std::string& path, bool keep_a
      barrier();
      VkBufferImageCopy region{};
      region.bufferOffset = offset;
@@ -2062,7 +2594,7 @@ index 87561f3..388b015 100644
      region.imageExtent = {img.width, img.height, 1};
      vkCmdCopyImageToBuffer(cmd(), img.image, VK_IMAGE_LAYOUT_GENERAL, ring_.buffer(), 1, &region);
      submit(true);
-@@ -570,7 +582,7 @@ void Renderer::save_sequence_image(uint32_t n) {
+@@ -570,7 +673,7 @@ void Renderer::save_sequence_image(uint32_t n) {
  
  void Renderer::profile_mark(const char* what, uint32_t a, uint32_t b, uint32_t c) {
      if (!profiling_ || profile_marks_.size() >= 8191) return;
@@ -2071,7 +2603,7 @@ index 87561f3..388b015 100644
                           static_cast<uint32_t>(profile_marks_.size()));
      profile_marks_.push_back({what, a, b, c});
  }
-@@ -655,6 +667,7 @@ void Renderer::swap() {
+@@ -655,6 +758,7 @@ void Renderer::swap() {
      }
      ++frame_number_;
      ++frames_;
@@ -2079,7 +2611,7 @@ index 87561f3..388b015 100644
      note_live_frame();
      const double t = now_seconds();
      if (t - window_start_ >= 10.0) {
-@@ -686,6 +699,13 @@ void Renderer::swap() {
+@@ -686,6 +790,13 @@ void Renderer::swap() {
                       waits_by_[2] * per_frame, waits_by_[3] * per_frame);
          submits_counted_ = submitted_;
          for (uint64_t& w : waits_by_) w = 0;
@@ -2094,7 +2626,7 @@ index 87561f3..388b015 100644
          spent_translate_ = spent_compile_ = spent_pipeline_ = spent_texture_ = spent_upload_ = {};
          if (!swap_delays_.empty()) {
 diff --git a/runtime/src/gpu/vulkan/renderer.h b/runtime/src/gpu/vulkan/renderer.h
-index 86683f6..f78f657 100644
+index 86683f6..ed6c357 100644
 --- a/runtime/src/gpu/vulkan/renderer.h
 +++ b/runtime/src/gpu/vulkan/renderer.h
 @@ -141,8 +141,25 @@ struct PipelineKey {
@@ -2131,7 +2663,20 @@ index 86683f6..f78f657 100644
      void sync() override;
      uint64_t flush() override;
      void wait_for(uint64_t value) override;
-@@ -269,9 +287,13 @@ private:
+@@ -256,9 +274,11 @@ private:
+     void load_texture(Texture& t);
+     void mark_textures_dirty(uint32_t address, uint64_t end);
+     bool load_texture_from_targets(Texture& t);
+-    void copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height);
++    void copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height,
++                               bool convert = false);
+     VkSampler sampler(const uint32_t words[3], const float border[4], bool compare);
+     Buffer depth_staging_; // video memory for depth -> texture copies
++    Image depth_float_;    // R32_SFLOAT: the step a converting depth -> texture copy blits from
+     // A 1x1 2D image of zeros, for texture slots with nothing bound.
+     const Image& null_texture();
+     Image null_texture_;
+@@ -269,9 +289,13 @@ private:
      const latte::Program* program(uint32_t address, uint32_t size, uint64_t& hash);
      VkPipelineLayout pipeline_layout(uint32_t vs_textures, uint32_t ps_textures, bool vs_registers,
                                       bool ps_registers);
@@ -2147,7 +2692,7 @@ index 86683f6..f78f657 100644
  
      // ---------------------------------------- interpolation (interpolate.cpp)
  public: // record types, shared with interpolate.cpp's helpers
-@@ -349,8 +371,8 @@ private:
+@@ -349,8 +373,8 @@ private:
      int current_record_ = 0;
      std::vector<int32_t> match_;     // this frame's draw -> previous frame's, -1 none
      struct Blend {
@@ -2158,7 +2703,18 @@ index 86683f6..f78f657 100644
      };
      std::unordered_map<uint64_t, Blend> blended_; // (previous, current offset) -> blend
      std::unordered_map<uint32_t, uint32_t> shared_blocks_; // current offset -> previous, of the draws that pair
-@@ -481,6 +503,9 @@ private:
+@@ -440,6 +464,10 @@ private:
+     std::atomic<int32_t> refresh_lead_{0};        // title vblank to the frame's first image, in refreshes
+     int64_t frame_due();
+     bool compute_present_ = false;        // presenting from a compute queue with a scaling shader
++    bool fan_as_indices_ = false;         // triangle fans drawn as a list, through generated indices
++    uint32_t submit_every_ = 0;           // TTT2_SUBMIT_EVERY=N: close the batch every N draws
++    uint32_t since_submit_ = 0;           // draws recorded since the last one
++    uint64_t idle_calls_ = 0;             // times the command processor said it had nothing left
+     uint32_t present_family_ = 0;
+     VkQueue present_queue_handle_ = VK_NULL_HANDLE;
+     VkPipelineLayout scale_layout_ = VK_NULL_HANDLE;
+@@ -481,6 +509,9 @@ private:
      Context ctx_;
      GuestMemory guest_;
      UploadRing ring_;
@@ -2206,10 +2762,98 @@ index 5bd50e6..e647d3d 100644
          write_back_free_.push_back(w.staging);
      }
 diff --git a/runtime/src/gpu/vulkan/textures.cpp b/runtime/src/gpu/vulkan/textures.cpp
-index 7267f02..7a3035a 100644
+index 7267f02..82ee28b 100644
 --- a/runtime/src/gpu/vulkan/textures.cpp
 +++ b/runtime/src/gpu/vulkan/textures.cpp
-@@ -490,8 +490,30 @@ void Renderer::load_texture(Texture& t) {
+@@ -195,7 +195,8 @@ void Renderer::create_texture_image(Texture& t, float scale) {
+     VK_CHECK(vkCreateImageView(ctx_.device, &vci, nullptr, &t.view));
+ }
+ 
+-void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height) {
++void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t width, uint32_t height,
++                                     bool convert) {
+     note_target_read(&src);
+     const uint32_t bytes = src.image.format == VK_FORMAT_D16_UNORM ? 2 : 4;
+     if (t.scale != src.scale) create_texture_image(t, src.scale);
+@@ -221,6 +222,33 @@ void Renderer::copy_depth_to_texture(const Target& src, Texture& t, uint32_t wid
+     vkCmdCopyImageToBuffer(cmd(), src.image.image, VK_IMAGE_LAYOUT_GENERAL, depth_staging_.buffer, 1, &region);
+     barrier();
+     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++    if (convert) {
++        // Los bytes del buffer son floats, y la textura los quiere normalizados a su tamano. La
++        // unica operacion que convierte entre formatos de color es el blit, y el blit quiere una
++        // imagen: esta.
++        if (depth_float_.width < width || depth_float_.height < height) {
++            if (depth_float_.image != VK_NULL_HANDLE) {
++                submit(true);
++                destroy_image(depth_float_);
++            }
++            depth_float_ = create_image(VK_FORMAT_R32_SFLOAT, VK_IMAGE_ASPECT_COLOR_BIT, width, height, 1, 1,
++                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
++                                        VK_IMAGE_VIEW_TYPE_2D);
++        }
++        vkCmdCopyBufferToImage(cmd(), depth_staging_.buffer, depth_float_.image, VK_IMAGE_LAYOUT_GENERAL, 1,
++                               &region);
++        barrier();
++        VkImageBlit blit{};
++        blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
++        blit.srcOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
++        blit.dstOffsets[1] = {static_cast<int32_t>(width), static_cast<int32_t>(height), 1};
++        vkCmdBlitImage(cmd(), depth_float_.image, VK_IMAGE_LAYOUT_GENERAL, t.image.image,
++                       VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
++        barrier();
++        profile_mark("depth to texture (converted)", src.address, width, height);
++        return;
++    }
+     vkCmdCopyBufferToImage(cmd(), depth_staging_.buffer, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+     barrier();
+     profile_mark("depth to texture", src.address, width, height);
+@@ -322,13 +350,39 @@ void Renderer::load_texture(Texture& t) {
+         if (const Target* src = find_target(depth_address, 0, true); src && src->written > src->overwritten) {
+             const bool compatible = (hw == fmt::k16) == (src->image.format == VK_FORMAT_D16_UNORM) &&
+                                     hw != fmt::kX24_8_32Float;
+-            if (!compatible) {
+-                std::fprintf(stderr, "ttt2: gpu: texture format 0x%03X over a depth buffer of format 0x%03X\n",
+-                             r.format, src->format);
++            // Donde no hay D16, un buffer de 16 bits es D32_SFLOAT(_S8_UINT) y lo que se copia de
++            // el son floats: eso si se sabe llevar al formato que la textura espera.
++            const bool convertible = !compatible && hw == fmt::k16 &&
++                                     (src->image.format == VK_FORMAT_D32_SFLOAT ||
++                                      src->image.format == VK_FORMAT_D32_SFLOAT_S8_UINT);
++            if (!compatible && !convertible) {
++                // No se puede copiar tal cual: la imagen del buffer de profundidad no tiene el
++                // formato que esta textura espera (en una Xbox, un buffer de 16 bits es D24S8
++                // porque D16 no se puede crear). Irse sin mas deja la textura con lo de antes,
++                // que es basura y se ve. Hasta que haya conversion de verdad, queda en «lejos»:
++                // el efecto que la lea no hara nada, en vez de dibujar ruido.
++                static bool dicho = false;
++                if (!dicho) {
++                    dicho = true;
++                    std::fprintf(stderr, "ttt2: gpu: textura de formato 0x%03X sobre un buffer de profundidad "
++                                         "0x%03X (imagen %d): no se puede copiar tal cual, queda en lejos\n",
++                                 r.format, src->format, static_cast<int>(src->image.format));
++                }
++                VkClearColorValue lejos{};
++                lejos.float32[0] = lejos.float32[1] = lejos.float32[2] = lejos.float32[3] = 1.0f;
++                VkImageSubresourceRange todo{VK_IMAGE_ASPECT_COLOR_BIT, 0, VK_REMAINING_MIP_LEVELS, 0,
++                                             VK_REMAINING_ARRAY_LAYERS};
++                end_rendering();
++                barrier();
++                vkCmdClearColorImage(cmd(), t.image.image, VK_IMAGE_LAYOUT_GENERAL, &lejos, 1, &todo);
++                barrier();
++                t.source = src;
++                t.loaded = stamp();
++                t.dirty = false;
+                 return;
+             }
+             if (t.source != src || t.loaded < src->written) {
+-                copy_depth_to_texture(*src, t, r.width, r.height);
++                copy_depth_to_texture(*src, t, r.width, r.height, convertible);
+                 t.source = src;
+                 t.loaded = stamp();
+                 t.dirty = false;
+@@ -490,8 +544,42 @@ void Renderer::load_texture(Texture& t) {
          const uint32_t slices = r.dim == gx2::kDim3D ? std::max(1u, r.depth >> level) : r.depth;
          const VkDeviceSize bytes = VkDeviceSize{ew} * eh * slices * f.bytes;
          VkDeviceSize offset = 0;
@@ -2238,11 +2882,23 @@ index 7267f02..7a3035a 100644
 +                staging[i * 4 + 2] = static_cast<uint8_t>((b << 3) | (b >> 2));
 +                staging[i * 4 + 3] = 0xFF;
 +            }
++        } else if (f.unpack == Unpack::kRgba4444) {
++            // 4_4_4_4 a R8G8B8A8, cada nibble a su byte. Repetir el nibble (x17) lleva 0xF a
++            // 0xFF, que es lo que el invitado entiende por opaco.
++            std::vector<uint16_t> packed(bytes / 2);
++            detile(tiled_level(level), ew, eh, 0, slices, reinterpret_cast<uint8_t*>(packed.data()));
++            for (size_t i = 0; i < packed.size(); ++i) {
++                const uint32_t v = packed[i];
++                staging[i * 4 + 0] = static_cast<uint8_t>((v & 0xF) * 17);
++                staging[i * 4 + 1] = static_cast<uint8_t>(((v >> 4) & 0xF) * 17);
++                staging[i * 4 + 2] = static_cast<uint8_t>(((v >> 8) & 0xF) * 17);
++                staging[i * 4 + 3] = static_cast<uint8_t>(((v >> 12) & 0xF) * 17);
++            }
 +        } else if (f.unpack == Unpack::kSnorm1010102) {
              // Signed 10_10_10_2 to R16G16B16A16_SNORM: each component sign
              // extended and scaled to its own range (-1 clamped as SNORM is).
              std::vector<uint32_t> packed(bytes / 4);
-@@ -595,6 +617,9 @@ void Renderer::invalidate(uint32_t address, uint32_t size, uint32_t coherency_fl
+@@ -595,6 +683,9 @@ void Renderer::invalidate(uint32_t address, uint32_t size, uint32_t coherency_fl
      mark_textures_dirty(address, uint64_t{address} + size);
  }
  
@@ -2252,7 +2908,7 @@ index 7267f02..7a3035a 100644
  void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
      if (frames_per_frame_ > 1) forget_snapshots(address, size);
      const uint64_t end = uint64_t{address} + size;
-@@ -607,6 +632,7 @@ void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
+@@ -607,6 +698,7 @@ void Renderer::cpu_wrote(uint32_t address, uint32_t size) {
                       static_cast<unsigned long long>(frame_number_));
      }
      if (size == 0) return;
@@ -3314,6 +3970,59 @@ index 6d7ba15..3e1a895 100644
          }
          g_callbacks.push_back(std::move(c));
      }
+diff --git a/runtime/src/os/heap.cpp b/runtime/src/os/heap.cpp
+index 552bb84..57f21a8 100644
+--- a/runtime/src/os/heap.cpp
++++ b/runtime/src/os/heap.cpp
+@@ -12,6 +12,8 @@
+ #include "cafe/runtime.h"
+ #include "cafe/sysmem.h"
+ 
++#include <cstdio>
++#include <cstdlib>
+ #include <map>
+ #include <set>
+ #include <memory>
+@@ -252,7 +254,26 @@ void default_heap_free(PPCContext& ctx, uint32_t block) {
+ void init_heaps(uint32_t mem2_begin) {
+     std::lock_guard lock(g_heap_mutex);
+     const uint32_t begin = align_up(mem2_begin, 0x1000);
+-    commit_guest_memory(begin, layout::kMem2End - begin);
++    // SMASH_MEM2_MB hands the title less MEM2 than a Wii U would. It costs twice what it says:
++    // the memory itself, and the copy of it the GPU reads where the driver cannot import host
++    // memory. An Xbox in developer mode gives an app about 2.6 GB in all, and the default 1 GiB
++    // of MEM2 does not fit twice inside that. The title asks the heap how much there is, so a
++    // smaller MEM2 is a smaller game, not a broken one -- until something asks for more than is
++    // left, and then it says so.
++    uint32_t end = layout::kMem2End;
++    if (const char* v = std::getenv("SMASH_MEM2_MB"); v != nullptr && *v != 0) {
++        const uint32_t mb = static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
++        const uint64_t wanted = uint64_t{begin} + (uint64_t{mb} << 20);
++        if (mb >= 64 && wanted < layout::kMem2End) {
++            end = static_cast<uint32_t>(wanted);
++            std::fprintf(stderr, "os: MEM2 limited to %u MiB (0x%08X-0x%08X) by SMASH_MEM2_MB\n", mb, begin,
++                         end - 1);
++        } else {
++            std::fprintf(stderr, "os: SMASH_MEM2_MB=%s ignored (needs 64 .. %llu)\n", v,
++                         static_cast<unsigned long long>((layout::kMem2End - begin) >> 20));
++        }
++    }
++    commit_guest_memory(begin, end - begin);
+     commit_guest_memory(layout::kMem1Base, layout::kMem1Size);
+     commit_guest_memory(layout::kForegroundBucketBase, layout::kForegroundBucketSize);
+     for (const uint32_t lc : layout::kLockedCacheBase) commit_guest_memory(lc, layout::kLockedCacheSize);
+@@ -260,9 +281,9 @@ void init_heaps(uint32_t mem2_begin) {
+     // just below 4 GiB, which the console survives (Smash's per-costume announcer call with the US4MP
+     // mod pack's sound config, which has no such table).
+     commit_guest_memory(0xFFFFF000u, 0x1000);
+-    set_mem2_bounds(begin, layout::kMem2End);
++    set_mem2_bounds(begin, end);
+     g_base_heaps[0] = create_frame_heap(layout::kMem1Base, layout::kMem1Size);
+-    g_base_heaps[1] = create_exp_heap(begin, layout::kMem2End - begin);
++    g_base_heaps[1] = create_exp_heap(begin, end - begin);
+     // The first 40 MiB of the bucket are free for the title.
+     g_base_heaps[8] = create_frame_heap(layout::kForegroundBucketBase, 0x2800000);
+ }
 diff --git a/runtime/src/os/kernel.h b/runtime/src/os/kernel.h
 index a3de794..86ef782 100644
 --- a/runtime/src/os/kernel.h

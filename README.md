@@ -14,11 +14,11 @@ This is an honest status, not a trailer. Dates are when each line was measured.
 |---|---|
 | **PC, Vulkan on an NVIDIA GPU** | **Plays, 59.9 FPS.** This is Smash4PC doing its job; the port changes nothing here |
 | **PC, Vulkan on Direct3D 12** (Mesa's Dozen) | **Boots, draws, reaches the attract demo.** Slow — tens of FPS at best, and after a few minutes it runs out of descriptor pools and stops (2026-11-04) |
-| **Xbox Series X, Developer Mode** | **Installs, starts, creates its Vulkan surface on the CoreWindow, uploads the guest memory, builds its swapchain and records command lists.** It has **not** been seen drawing a frame on the console yet (2026-11-04) |
+| **Xbox Series X, Developer Mode** | **Draws.** Title screen, main menu and the attract demo, on a television (2026-11-04). With `TTT2_SUBMIT_EVERY=1`, which costs one submission per draw and holds it at ~15 FPS; without it the process is killed for memory. Menus come out with the same sprite repeated four times |
 
-So: on the console the whole chain is up and the last known blocker is gone, but **nobody has
-seen this draw a picture on a television**. If you are here for a finished port, it is not one
-yet. [Issues](../../issues) says what is left and what each thing would take.
+So: it draws, it reaches the menu, and it plays its own demo — but it is held together by a
+submission per draw, and the menus have ghosting. If you are here for a finished port, it is not
+one yet. [Issues](../../issues) says what is left and what each thing would take.
 
 ## Which console this was tested on
 

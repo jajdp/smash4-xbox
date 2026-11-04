@@ -1,5 +1,57 @@
 # Changelog
 
+## 0.2.0 — 2026-11-04
+
+The console draws. Title screen, main menu and the attract demo, on a television. It is held up
+by `TTT2_SUBMIT_EVERY=1` — one submission per draw, ~15 FPS — and the menus ghost, but the chain
+from dump to picture is closed.
+
+**Mesa (`patches/mesa-dozen-xbox.patch`)**
+
+* `dzn_cmd_buffer_update_viewports()` dereferenced a null pipeline. When Dozen emulates a
+  triangle fan it dispatches a compute shader, clears `state.pipeline` and marks **only** the
+  compute bindpoint dirty; the blit and resolve paths in the same file mark the graphics one too.
+  Nothing drew on the console until this: the first thing the title draws is a triangle fan.
+  Found from a crash dump — `vulkan_dzn.dll+0xC1E7`, reading `0x4CC` — resolved with
+  `llvm-symbolizer` because the console has no debugger.
+* `OpenExistingHeapFromAddress1` now says which `HRESULT` it failed with, and what Windows thinks
+  of that memory. On an Xbox it answers `E_INVALIDARG` for memory that is committed,
+  `PAGE_READWRITE` and contiguous — so `VK_EXT_external_memory_host` cannot work there and the
+  guest memory has to be copied. That is 1 GiB that cannot be given back.
+
+**The renderer**
+
+* Triangle fans drawn as a list through generated indices, instead of Dozen's emulation: one
+  dispatch and one barrier less per draw.
+* `D16_UNORM` was the only depth format whose fallback was not checked. A console says it has it
+  and then asks for zero bytes to hold an image of it; the game died at its first shadow map.
+* A depth buffer read as a texture is now converted when the formats do not match: depth → buffer
+  → `R32_SFLOAT` image → **blit**, which is the only Vulkan operation that converts between
+  colour formats. 16-bit buffers prefer a float depth format for exactly this.
+* `4_4_4_4` unpacked on upload to `R8G8B8A8_UNORM` when neither `A4B4G4R4` nor `R4G4B4A4` exists.
+  A console has neither, and that is the format of the interface sprites with transparency.
+* Emulated push descriptors: running out of pool space now **closes the batch**, which is the
+  only thing that gives the sets back. It used to make another pool, and another, up to 1024,
+  each with its own memory — on a console with ~2.6 GB for the app, the system takes the process
+  away without a word. Pools also grew from 256 to 1024 sets.
+* A new image's barrier covers both planes of a depth-stencil format, not just the view's aspect.
+
+**Switches, all off by default**
+
+| Variable | What it does |
+|---|---|
+| `TTT2_SUBMIT_EVERY=N` | Close the batch every N draws. `1` is what currently holds the console up |
+| `TTT2_GPU_TIMEOUT=seconds` | How long to wait for the GPU before calling it dead. Tells apart a hang from something absurdly slow |
+| `TTT2_NO_D16=1`, `TTT2_NO_4444=1` | Pretend the driver lacks those formats, to reproduce a console's behaviour on a PC |
+| `TTT2_TRACE_GUEST_SPAN=1` | How much of a guest region the GPU ever reads. Measured: 369 MiB of MEM2's gigabyte |
+| `TTT2_FATAL_CRASH=1` | Make a fatal error leave a crash dump, the only way to see the other threads on a console |
+
+**Tools**
+
+* `pc/probar-en-el-pc.ps1`: one run on a PC from end to end, capturing from the render and
+  leaving nothing alive. With `TTT2_NO_D16` and company it reproduces a console's quirks with a
+  one-minute cycle instead of ten.
+
 ## 0.1.0 — 2026-11-04
 
 First public version. What it does and does not do is in the README's first table; the short
