@@ -1,0 +1,102 @@
+# Nothing that belongs to the game, to Smash4PC or to Mesa ever goes in here.
+
+# Wii U dumps and anything out of one
+*.rpx
+*.rpl
+*.wud
+*.wux
+*.wua
+*.iso
+*.nus
+*.app
+*.h3
+*.tik
+*.tmd
+*.cert
+content/
+code/
+meta/
+*.pack
+*.szs
+*.bfres
+*.nus3bank
+*.nus3audio
+*.dt00
+*.dt01
+*.parte*
+
+# build output
+*.exe
+*.dll
+*.lib
+*.obj
+*.o
+*.a
+*.pdb
+*.ilk
+*.exp
+*.msix
+*.appx
+*.msixbundle
+*.rsp
+build/
+build-uwp/
+build-deps-uwp/
+obj/
+generated/
+contenido/
+stage-*/
+
+# signing certificates: yours is yours
+*.pfx
+*.p12
+*.cer
+*.snk
+*.pem
+*.key
+
+# CREDENTIALS. The Device Portal user and password live in
+# %LOCALAPPDATA%\xbox-devportal\credenciales.txt, outside this tree, and must never be
+# committed: a public repository cannot be un-leaked.
+credenciales.txt
+credentials.txt
+.env
+*.env
+secrets.*
+
+# saves, caches, logs and measurements
+*.sav
+*.log
+*.txt.bak
+smash.log
+arranque.log
+traza.txt
+espacio.txt
+huella.txt
+cache/
+save/
+mediciones/
+
+# screenshots of a console carry its name and IP: look at every one before adding it
+capturas/
+screenshots/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+venv-meson/
+
+# editors and OS
+.vs/
+.vscode/
+.idea/
+*.swp
+*.tmp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# The package tiles are supplied by whoever packages (docs/ASSETS.md).
+package/Assets/*.png

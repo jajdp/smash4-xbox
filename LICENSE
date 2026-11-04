@@ -1,0 +1,45 @@
+MIT License
+
+Copyright (c) 2026 jajdp                 (the UWP port: everything new in this repository)
+Copyright (c) 2026 Petexy / Linexy       (Smash4PC, which patches/smash4pc-xbox.patch modifies)
+Copyright (c) Microsoft Corporation      (Mesa's Dozen driver, src/microsoft/vulkan/*)
+Copyright (c) 2015, 2021 Intel Corporation (Mesa's Vulkan WSI and runtime, src/vulkan/*)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+
+Why those four lines, and not a copied boilerplate:
+
+  * The port itself -- the scripts, the UWP entry point, the Mesa stubs, the
+    documentation -- is new work and is published under this MIT license.
+
+  * patches/smash4pc-xbox.patch is a derivative work of Smash4PC, whose LICENSE
+    reads "MIT License / Copyright (c) 2026 Petexy / Linexy". MIT allows
+    modified versions as long as its notice travels with them, which is what
+    the second line above does. Smash4PC's repository is maintained by JosiahG;
+    the copyright holder named in its LICENSE file is Petexy / Linexy, and that
+    is the name a license file has to carry.
+
+  * patches/mesa-dozen-xbox.patch is a derivative work of Mesa. Every file it
+    touches carries an MIT header: Microsoft's for the Dozen driver, Intel's
+    for the Vulkan WSI and runtime. Mesa as a whole is a collection of
+    components with different licenses -- these particular ones are MIT.
+
+NOTICE.md says what each piece is and what this repository does NOT distribute.

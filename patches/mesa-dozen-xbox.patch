@@ -1,0 +1,362 @@
+diff --git a/src/microsoft/compiler/dxil_validator.cpp b/src/microsoft/compiler/dxil_validator.cpp
+index fab8c85..acde260 100644
+--- a/src/microsoft/compiler/dxil_validator.cpp
++++ b/src/microsoft/compiler/dxil_validator.cpp
+@@ -27,16 +27,54 @@ extern "C" {
+ extern IMAGE_DOS_HEADER __ImageBase;
+ }
+ 
++
++/* --- UWP: LoadLibraryA no esta permitida en el contenedor ------------------------------
++ *
++ * Una app empaquetada solo puede cargar bibliotecas de su propio paquete
++ * (LoadPackagedLibrary) o del sistema (LoadLibraryExW + LOAD_LIBRARY_SEARCH_SYSTEM32).
++ * DXIL.dll viaja en el paquete y DXGI.DLL es del sistema, asi que se prueban los dos. */
++#include <stdio.h>
++
++static HMODULE uwp_cargar(const char *nombre)
++{
++   /* El paquete puede traer el archivo con otra caja que la que pide quien lo busca
++    * («dxil.dll» contra «DXIL.dll»), y LoadPackagedLibrary no perdona eso. Se prueban las
++    * tres grafias, y despues el sistema, que es de donde viene DXGI. */
++   char copia[260];
++   wchar_t ancho[260];
++   HMODULE m = NULL;
++   int i, paso;
++   for (paso = 0; paso < 3 && m == NULL; paso++) {
++      for (i = 0; nombre[i] != 0 && i < 259; i++) {
++         char c = nombre[i];
++         if (paso == 1 && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
++         if (paso == 2 && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
++         copia[i] = c;
++      }
++      copia[i] = 0;
++      if (MultiByteToWideChar(CP_ACP, 0, copia, -1, ancho, 260) <= 0)
++         continue;
++      m = LoadPackagedLibrary(ancho, 0);
++      if (m == NULL)
++         m = LoadLibraryExW(ancho, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++      if (m != NULL)
++         fprintf(stderr, "dzn: %s cargada como %s\n", nombre, copia);
++   }
++   if (m == NULL)
++      fprintf(stderr, "dzn: NO pude cargar %s (ni en el paquete ni en el sistema)\n", nombre);
++   return m;
++}
++
+ static HMODULE
+ load_dxil_mod()
+ {
+    /* First, try to load DXIL.dll from the default search-path */
+ #if defined(_GAMING_XBOX_SCARLETT)
+-   HMODULE mod = LoadLibraryA("dxcompiler_xs.dll");
++   HMODULE mod = uwp_cargar("dxcompiler_xs.dll");
+ #elif defined (_GAMING_XBOX)
+-   HMODULE mod = LoadLibraryA("dxcompiler_x.dll");
++   HMODULE mod = uwp_cargar("dxcompiler_x.dll");
+ #else
+-   HMODULE mod = LoadLibraryA("DXIL.dll");
++   HMODULE mod = uwp_cargar("DXIL.dll");
+ #endif
+    if (mod)
+       return mod;
+@@ -199,7 +237,7 @@ dxil_create_validator(const void *ctx)
+     * will fail on most end-users install. So we do not error out if this
+     * fails.
+     */
+-   val->dxcompiler_mod = LoadLibraryA("dxcompiler.dll");
++   val->dxcompiler_mod = uwp_cargar("dxcompiler.dll");
+    if (val->dxcompiler_mod) {
+       /* If we managed to load dxcompiler.dll, but either don't find
+        * DxcCreateInstance, or fail to create IDxcLibrary or
+diff --git a/src/microsoft/vulkan/dzn_cmd_buffer.c b/src/microsoft/vulkan/dzn_cmd_buffer.c
+index fd85f88..0fc0bd8 100644
+--- a/src/microsoft/vulkan/dzn_cmd_buffer.c
++++ b/src/microsoft/vulkan/dzn_cmd_buffer.c
+@@ -1069,6 +1069,41 @@ dzn_cmd_buffer_gather_queries(struct dzn_cmd_buffer *cmdbuf)
+    return VK_SUCCESS;
+ }
+ 
++/* Close() no dice que comando rechazo. El InfoQueue del dispositivo si, siempre que la capa
++ * de depuracion este encendida (DZN_DEBUG=d3d12). */
++static void
++dzn_cmd_buffer_dump_messages(struct dzn_cmd_buffer *cmdbuf, HRESULT hres)
++{
++   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
++
++   fprintf(stderr, "dzn: ID3D12GraphicsCommandList::Close = 0x%08lx\n", (unsigned long)hres);
++
++   ID3D12InfoQueue *iq = NULL;
++   if (FAILED(ID3D12Device4_QueryInterface(device->dev, &IID_ID3D12InfoQueue, (void **)&iq))) {
++      fprintf(stderr, "dzn: sin InfoQueue; arranca con DZN_DEBUG=d3d12 para saber el motivo\n");
++      fflush(stderr);
++      return;
++   }
++
++   const UINT64 n = ID3D12InfoQueue_GetNumStoredMessages(iq);
++   if (n == 0)
++      fprintf(stderr, "dzn: el InfoQueue esta vacio: la capa de depuracion esta apagada\n");
++   for (UINT64 i = 0; i < n; i++) {
++      SIZE_T len = 0;
++      if (FAILED(ID3D12InfoQueue_GetMessage(iq, i, NULL, &len)))
++         continue;
++      D3D12_MESSAGE *m = malloc(len);
++      if (!m)
++         continue;
++      if (SUCCEEDED(ID3D12InfoQueue_GetMessage(iq, i, m, &len)))
++         fprintf(stderr, "dzn: D3D12 #%u: %s\n", (unsigned)m->ID, m->pDescription);
++      free(m);
++   }
++   ID3D12InfoQueue_ClearStoredMessages(iq);
++   ID3D12InfoQueue_Release(iq);
++   fflush(stderr);
++}
++
+ VKAPI_ATTR VkResult VKAPI_CALL
+ dzn_EndCommandBuffer(VkCommandBuffer commandBuffer)
+ {
+@@ -1078,8 +1113,10 @@ dzn_EndCommandBuffer(VkCommandBuffer commandBuffer)
+       dzn_cmd_buffer_gather_events(cmdbuf);
+       dzn_cmd_buffer_gather_queries(cmdbuf);
+       HRESULT hres = ID3D12GraphicsCommandList1_Close(cmdbuf->cmdlist);
+-      if (FAILED(hres))
++      if (FAILED(hres)) {
++         dzn_cmd_buffer_dump_messages(cmdbuf, hres);
+          vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
+    }
+ 
+    return vk_command_buffer_end(&cmdbuf->vk);
+@@ -3245,8 +3282,16 @@ dzn_cmd_buffer_update_pipeline(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint
+    }
+ 
+    /* Deferring this until after the pipeline has been set due to an NVIDIA driver bug
+-    * when view instancing mask is set with no pipeline bound. */
+-   if (view_instance_mask)
++    * when view instancing mask is set with no pipeline bound.
++    *
++    * Only where the hardware has view instancing at all: on a device without it (any AMD
++    * GPU, the Xbox Series X among them) this call is rejected, the command list goes into
++    * an error state and Close() fails, so nothing is ever drawn. A mask of 1 is the default
++    * single view anyway, so there is nothing to set. */
++   struct dzn_physical_device *pdev =
++      container_of(device->vk.physical, struct dzn_physical_device, vk);
++   if (view_instance_mask &&
++       pdev->options3.ViewInstancingTier > D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED)
+       ID3D12GraphicsCommandList1_SetViewInstanceMask(cmdbuf->cmdlist, view_instance_mask);
+ }
+ 
+diff --git a/src/microsoft/vulkan/dzn_device.c b/src/microsoft/vulkan/dzn_device.c
+index 4a4dde5..fe777b5 100644
+--- a/src/microsoft/vulkan/dzn_device.c
++++ b/src/microsoft/vulkan/dzn_device.c
+@@ -3330,9 +3330,14 @@ dzn_BindBufferMemory2(VkDevice _device,
+       } else {
+          D3D12_RESOURCE_DESC desc = buffer->desc;
+          desc.Flags |= mem->res_flags;
++         /* `desc`, not buffer->desc: the flags just added have to reach D3D12. Host-imported
++          * memory (VK_EXT_external_memory_host) comes back as a cross-adapter heap, and D3D12
++          * rejects a placed resource there without ALLOW_CROSS_ADAPTER, which is what
++          * mem->res_flags carries. res_flags is zero for ordinary allocations, so the bug only
++          * showed up on that path. */
+          if (FAILED(ID3D12Device1_CreatePlacedResource(device->dev, mem->heap,
+                                                        pBindInfos[i].memoryOffset,
+-                                                       &buffer->desc,
++                                                       &desc,
+                                                        D3D12_RESOURCE_STATE_COMMON,
+                                                        NULL,
+                                                        &IID_ID3D12Resource,
+diff --git a/src/microsoft/vulkan/dzn_dxgi.c b/src/microsoft/vulkan/dzn_dxgi.c
+index 7dbcfa6..7335b9f 100644
+--- a/src/microsoft/vulkan/dzn_dxgi.c
++++ b/src/microsoft/vulkan/dzn_dxgi.c
+@@ -64,6 +64,40 @@ dzn_enumerate_physical_devices_dxgi(struct vk_instance *instance)
+    return result;
+ }
+ 
++/* UWP: LoadLibraryA no vale dentro del contenedor. Se prueba primero el paquete y
++ * luego el sistema, que es de donde viene DXGI. */
++#include <stdio.h>
++
++static HMODULE uwp_cargar(const char *nombre)
++{
++   /* El paquete puede traer el archivo con otra caja que la que pide quien lo busca
++    * («dxil.dll» contra «DXIL.dll»), y LoadPackagedLibrary no perdona eso. Se prueban las
++    * tres grafias, y despues el sistema, que es de donde viene DXGI. */
++   char copia[260];
++   wchar_t ancho[260];
++   HMODULE m = NULL;
++   int i, paso;
++   for (paso = 0; paso < 3 && m == NULL; paso++) {
++      for (i = 0; nombre[i] != 0 && i < 259; i++) {
++         char c = nombre[i];
++         if (paso == 1 && c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
++         if (paso == 2 && c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
++         copia[i] = c;
++      }
++      copia[i] = 0;
++      if (MultiByteToWideChar(CP_ACP, 0, copia, -1, ancho, 260) <= 0)
++         continue;
++      m = LoadPackagedLibrary(ancho, 0);
++      if (m == NULL)
++         m = LoadLibraryExW(ancho, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
++      if (m != NULL)
++         fprintf(stderr, "dzn: %s cargada como %s\n", nombre, copia);
++   }
++   if (m == NULL)
++      fprintf(stderr, "dzn: NO pude cargar %s (ni en el paquete ni en el sistema)\n", nombre);
++   return m;
++}
++
+ IDXGIFactory4 *
+ dxgi_get_factory(bool debug)
+ {
+@@ -72,7 +106,7 @@ dxgi_get_factory(bool debug)
+       { 0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a }
+    };
+ 
+-   HMODULE dxgi_mod = LoadLibraryA("DXGI.DLL");
++   HMODULE dxgi_mod = uwp_cargar("DXGI.DLL");
+    if (!dxgi_mod) {
+       mesa_loge("failed to load DXGI.DLL\n");
+       return NULL;
+diff --git a/src/microsoft/vulkan/dzn_image.c b/src/microsoft/vulkan/dzn_image.c
+index b67d131..3ca641f 100644
+--- a/src/microsoft/vulkan/dzn_image.c
++++ b/src/microsoft/vulkan/dzn_image.c
+@@ -904,6 +904,22 @@ dzn_GetImageMemoryRequirements2(VkDevice _device,
+       info = dzn_ID3D12Device4_GetResourceAllocationInfo(device->dev, 0, 1, &image->desc);
+    }
+ 
++   /* D3D12 no explica por que rechaza un recurso: devuelve este tamano imposible. Al menos
++    * que se vea la descripcion, que es donde esta el problema. */
++   if (info.SizeInBytes == UINT64_MAX) {
++      fprintf(stderr, "dzn: D3D12 rechaza la imagen: dim %u, DXGI_FORMAT %u, %llux%llux%u, "
++                      "%u mips, %u muestras (calidad %u), layout %u, flags 0x%x, "
++                      "castables %u, VkFormat %u, usage 0x%x\n",
++              (unsigned)image->desc.Dimension, (unsigned)image->desc.Format,
++              (unsigned long long)image->desc.Width, (unsigned long long)image->desc.Height,
++              (unsigned)image->desc.DepthOrArraySize, (unsigned)image->desc.MipLevels,
++              (unsigned)image->desc.SampleDesc.Count, (unsigned)image->desc.SampleDesc.Quality,
++              (unsigned)image->desc.Layout, (unsigned)image->desc.Flags,
++              (unsigned)image->castable_format_count, (unsigned)image->vk.format,
++              (unsigned)image->vk.usage);
++      fflush(stderr);
++   }
++
+    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
+       .size = info.SizeInBytes,
+       .alignment = info.Alignment,
+diff --git a/src/vulkan/runtime/vk_log.c b/src/vulkan/runtime/vk_log.c
+index 2442219..9fa196d 100644
+--- a/src/vulkan/runtime/vk_log.c
++++ b/src/vulkan/runtime/vk_log.c
+@@ -21,6 +21,8 @@
+  * IN THE SOFTWARE.
+  */
+ 
++#include <stdio.h>
++#include <stdlib.h>
+ #include "vk_log.h"
+ #include "vk_debug_utils.h"
+ #include "vk_debug_report.h"
+@@ -313,6 +315,18 @@ __vk_errorv(const void *_obj, VkResult error,
+ 
+    const char *error_str = vk_Result_to_str(error);
+ 
++   /* Sin capas de validacion ni depurador (una Xbox en modo desarrollador), esta linea es
++    * la unica forma de saber donde nacio un error que luego aparece en otro sitio. Apagada
++    * por omision: hay errores que son parte del funcionamiento normal —un pool de
++    * descriptores que se llena— y escribirlos todos cuesta mas que el propio dibujo. */
++   static int trazar = -1;
++   if (trazar < 0)
++      trazar = getenv("MESA_TRACE_ERRORS") != NULL;
++   if (trazar) {
++      fprintf(stderr, "dzn: %s en %s:%d\n", error_str, file, line);
++      fflush(stderr);
++   }
++
+    /* From the Vulkan 1.3.295 spec:
+     *
+     *    "VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT specifies use of
+diff --git a/src/vulkan/wsi/wsi_common_win32.cpp b/src/vulkan/wsi/wsi_common_win32.cpp
+index 6929684..36c8744 100644
+--- a/src/vulkan/wsi/wsi_common_win32.cpp
++++ b/src/vulkan/wsi/wsi_common_win32.cpp
+@@ -42,6 +42,15 @@
+ 
+ #include <dcomp.h>
+ 
++/* En UWP (Xbox incluida) no hay ventanas de escritorio ni compositor al que colgar una
++ * visual: lo que la superficie guarda en «hwnd» es el CoreWindow de la aplicacion y la
++ * cadena se crea con CreateSwapChainForCoreWindow, que presenta directo a la pantalla. */
++/* Mesa se compila con los encabezados de escritorio a proposito (igual que en rpcs3-xbox),
++ * asi que WINAPI_FAMILY no delata nada: la marca la pone mesa_uwp_compat.h. */
++#ifndef MESA_WSI_UWP
++#define MESA_WSI_UWP 0
++#endif
++
+ #if defined(__GNUC__)
+ #pragma GCC diagnostic ignored "-Wint-to-pointer-cast"      // warning: cast to pointer from integer of different size
+ #endif
+@@ -795,8 +804,11 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
+    }
+ 
+    if (chain->surface->current_swapchain != chain) {
+-      chain->surface->visual->SetContent(chain->dxgi);
+-      chain->wsi->dxgi.dcomp->Commit();
++      /* En UWP no hay visual: la cadena de CoreWindow presenta por si misma. */
++      if (chain->surface->visual) {
++         chain->surface->visual->SetContent(chain->dxgi);
++         chain->wsi->dxgi.dcomp->Commit();
++      }
+       chain->surface->current_swapchain = chain;
+    }
+ 
+@@ -888,6 +900,28 @@ wsi_win32_surface_create_swapchain_dxgi(
+       desc.BufferUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
+ 
+    IDXGISwapChain1 *swapchain1;
++#if MESA_WSI_UWP
++   /* Una cadena de CoreWindow siempre es destino de dibujo, diga lo que diga el usage de
++    * Vulkan: con BufferUsage 0 DXGI la rechaza. */
++   desc.BufferUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
++   {
++      HRESULT hr = factory->CreateSwapChainForCoreWindow(
++         queue, (IUnknown *)surface->base.hwnd, &desc, NULL, &swapchain1);
++      if (FAILED(hr)) {
++         fprintf(stderr, "dzn: CreateSwapChainForCoreWindow(%ux%u, %u imagenes) = 0x%08lx\n",
++                 desc.Width, desc.Height, desc.BufferCount, (unsigned long)hr);
++         return VK_ERROR_INITIALIZATION_FAILED;
++      }
++      if (FAILED(swapchain1->QueryInterface(&chain->dxgi))) {
++         swapchain1->Release();
++         return VK_ERROR_INITIALIZATION_FAILED;
++      }
++      swapchain1->Release();
++      /* Sin visual que componer, esta cadena ya es la que se ve. */
++      surface->current_swapchain = chain;
++      return VK_SUCCESS;
++   }
++#endif
+    if (FAILED(factory->CreateSwapChainForComposition(queue, &desc, NULL, &swapchain1)) ||
+        FAILED(swapchain1->QueryInterface(&chain->dxgi)))
+       return VK_ERROR_INITIALIZATION_FAILED;
+@@ -960,7 +994,7 @@ wsi_win32_surface_create_swapchain(
+    };
+ 
+    bool supports_dxgi = wsi->dxgi.factory &&
+-                        wsi->dxgi.dcomp &&
++                        (MESA_WSI_UWP || wsi->dxgi.dcomp) &&
+                         wsi->wsi->win32.get_d3d12_command_queue;
+    struct wsi_base_image_params *image_params = supports_dxgi ?
+       &dxgi_image_params.base : &cpu_image_params.base;
+@@ -1099,7 +1133,7 @@ wsi_win32_init_wsi(struct wsi_device *wsi_device,
+          goto fail;
+       }
+       wsi->dxgi.dcomp = dcomp_get_device();
+-      if (!wsi->dxgi.dcomp) {
++      if (!wsi->dxgi.dcomp && !MESA_WSI_UWP) {
+          wsi->dxgi.factory->Release();
+          vk_free(alloc, wsi);
+          result = VK_ERROR_INITIALIZATION_FAILED;

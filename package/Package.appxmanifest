@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Replace every CHANGE-ME before packaging:
+       * Name        a package name of your own
+       * Publisher   must match the subject of YOUR signing certificate, exactly
+       * PhoneProductId  any GUID you generate
+     tools/empaquetar.ps1 writes Version from its -Version parameter. -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:mp="http://schemas.microsoft.com/appx/2014/phone/manifest"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  IgnorableNamespaces="uap mp">
+
+  <Identity
+    Name="CHANGE-ME-Smash4-Recomp"
+    Publisher="CN=CHANGE-ME"
+    Version="0.1.0.0"
+    ProcessorArchitecture="x64" />
+
+  <mp:PhoneIdentity PhoneProductId="CHANGE-ME-00000000-0000-0000-0000-000000000000"
+                    PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
+
+  <Properties>
+    <DisplayName>Smash 4 Recomp</DisplayName>
+    <PublisherDisplayName>CHANGE-ME</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Universal" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+    <PackageDependency Name="Microsoft.VCLibs.140.00" MinVersion="14.0.33519.0" Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us"/>
+  </Resources>
+
+  <Applications>
+    <Application Id="App"
+      Executable="smash.exe"
+      EntryPoint="Smash4.App">
+      <uap:VisualElements
+        DisplayName="Smash 4 Recomp"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        Description="Super Smash Bros. for Wii U, statically recompiled by Smash4PC, as a UWP package for an Xbox in Developer Mode, with Vulkan on Direct3D 12"
+        BackgroundColor="transparent">
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png"/>
+      </uap:VisualElements>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Only what the runtime's netplay uses. Drop both if you do not want it reaching the
+         network at all. -->
+    <Capability Name="internetClient" />
+    <Capability Name="privateNetworkClientServer" />
+  </Capabilities>
+</Package>
