@@ -224,7 +224,7 @@ index 7c1b5ee..51456dc 100644
  // ticks (so GX2GPUTimeToCPUTime is the identity).
  uint64_t clock();
 diff --git a/runtime/src/gpu/vulkan/context.cpp b/runtime/src/gpu/vulkan/context.cpp
-index 31bfd45..a640541 100644
+index 31bfd45..e804db5 100644
 --- a/runtime/src/gpu/vulkan/context.cpp
 +++ b/runtime/src/gpu/vulkan/context.cpp
 @@ -2,6 +2,7 @@
@@ -897,7 +897,7 @@ index 31bfd45..a640541 100644
  }
  
  // ------------------------------------------------------------ upload ring
-@@ -450,4 +822,88 @@ uint8_t* UploadRing::allocate(VkDeviceSize size, VkDeviceSize alignment, VkDevic
+@@ -450,4 +822,100 @@ uint8_t* UploadRing::allocate(VkDeviceSize size, VkDeviceSize alignment, VkDevic
      return buffer_.mapped + start;
  }
  
@@ -944,6 +944,8 @@ index 31bfd45..a640541 100644
 +void Context::reset_descriptor_pool(uint32_t pool) {
 +    if (push_descriptor || pool >= kDescriptorPools) return;
 +    for (VkDescriptorPool p : descriptor_pools[pool]) VK_CHECK(vkResetDescriptorPool(device, p, 0));
++    descriptor_pool_cursor[pool] = 0;
++    descriptor_sets_served[pool] = 0;
 +}
 +
 +void Context::push_descriptor_set(VkCommandBuffer cmd, VkPipelineBindPoint bind_point, VkPipelineLayout layout,
@@ -961,22 +963,32 @@ index 31bfd45..a640541 100644
 +        set_layout = it->second;
 +    }
 +    std::vector<VkDescriptorPool>& pools = descriptor_pools[pool];
-+    if (pools.empty()) pools.push_back(create_descriptor_pool());
++    uint32_t& cursor = descriptor_pool_cursor[pool];
 +    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
 +    ai.descriptorSetCount = 1;
 +    ai.pSetLayouts = &set_layout;
 +    VkDescriptorSet destination = VK_NULL_HANDLE;
 +    for (uint32_t attempt = 0;; ++attempt) {
-+        ai.descriptorPool = pools.back();
++        if (cursor >= pools.size()) pools.push_back(create_descriptor_pool());
++        ai.descriptorPool = pools[cursor];
 +        const VkResult r = vkAllocateDescriptorSets(device, &ai, &destination);
 +        if (r == VK_SUCCESS) break;
-+        // A full or fragmented pool is not an error here: it means this slot needs another one.
++        // A full or fragmented pool is not an error here: it means this slot moves on to the
++        // next one, and only makes a new one once they are all spent.
 +        if (r != VK_ERROR_OUT_OF_POOL_MEMORY && r != VK_ERROR_FRAGMENTED_POOL) {
 +            check_failed("vkAllocateDescriptorSets", r, __FILE__, __LINE__);
 +        }
 +        if (attempt >= 1024) fatal("Vulkan: push descriptors: pool %u stopped growing", pool);
-+        pools.push_back(create_descriptor_pool());
++        ++cursor;
++        // TTT2_TRACE_POOLS: ¿se estabiliza el numero de pools por slot o crece sin parar? Lo
++        // segundo significa que algo no se esta liberando.
++        if (std::getenv("TTT2_TRACE_POOLS")) {
++            std::fprintf(stderr, "ttt2: GPU: slot %u pasa a su pool %u de %zu, con %u sets servidos "
++                                 "desde el ultimo reset\n",
++                         pool, cursor + 1, pools.size(), descriptor_sets_served[pool]);
++        }
 +    }
++    ++descriptor_sets_served[pool];
 +    // The same writes, now aimed at a real set. Reused across draws so a draw costs no allocation.
 +    static thread_local std::vector<VkWriteDescriptorSet> aimed;
 +    aimed.assign(writes, writes + count);
@@ -987,7 +999,7 @@ index 31bfd45..a640541 100644
 +
  } // namespace cafe::gpu::vk
 diff --git a/runtime/src/gpu/vulkan/context.h b/runtime/src/gpu/vulkan/context.h
-index 8397b1f..e9a8878 100644
+index 8397b1f..fed3d96 100644
 --- a/runtime/src/gpu/vulkan/context.h
 +++ b/runtime/src/gpu/vulkan/context.h
 @@ -3,15 +3,42 @@
@@ -1097,7 +1109,7 @@ index 8397b1f..e9a8878 100644
      uint32_t memory_type(uint32_t type_bits, VkMemoryPropertyFlags flags) const;
      Buffer create_buffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags flags);
      void destroy_buffer(Buffer& buffer);
-@@ -67,26 +129,109 @@ struct Context {
+@@ -67,26 +129,114 @@ struct Context {
          vkGetPhysicalDeviceFormatProperties(physical, format, &p);
          return p.optimalTilingFeatures;
      }
@@ -1106,6 +1118,11 @@ index 8397b1f..e9a8878 100644
 +    // another pool joins it rather than the frame failing, and reset frees the lot. Only touched
 +    // when push_descriptor is false.
 +    std::vector<VkDescriptorPool> descriptor_pools[kDescriptorPools];
++    // Por que pool de la lista va cada slot. El reset lo devuelve a cero: a partir de ahi
++    // estan todos vacios otra vez y hay que gastarlos en orden.
++    uint32_t descriptor_pool_cursor[kDescriptorPools] = {};
++    // Sets servidos por cada slot desde su ultimo reset (solo para TTT2_TRACE_POOLS).
++    uint32_t descriptor_sets_served[kDescriptorPools] = {};
 +    std::unordered_map<VkPipelineLayout, VkDescriptorSetLayout> set_layouts;
 +    std::mutex set_layouts_mutex; // pipelines are also built on worker threads
 +    VkDescriptorPool create_descriptor_pool();
@@ -1219,7 +1236,7 @@ index 8397b1f..e9a8878 100644
  };
  
  // Host-visible memory the renderer writes per draw and per transfer
-@@ -114,7 +259,6 @@ public:
+@@ -114,7 +264,6 @@ public:
      }
      VkDeviceSize chunk_size() const { return buffer_.size / kChunks; }
      VkBuffer buffer() const { return buffer_.buffer; }

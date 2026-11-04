@@ -18,6 +18,10 @@ drawing a frame there yet.
   formats this driver does not have.
 * `R4G4_UNORM_PACK8` → `R8G8_UNORM` and `B5G6R5_UNORM_PACK16` → `R8G8B8A8_UNORM`, unpacked on
   upload. Neither exists in DXGI.
+* Emulated push descriptors: each slot now walks its own list of pools from the first one after
+  a reset, instead of always using the last. The old way spent one pool per pass and grew the
+  list forever — 44 pools in a slot that had served 108 sets — until `vkCreateDescriptorPool`
+  ran out of host memory. A slot settles at five. `TTT2_TRACE_POOLS=1` shows it.
 * On Dozen, present from the drawing queue: its swapchain cannot be written by a shader even
   though `supportedUsageFlags` says it can.
 
