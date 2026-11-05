@@ -70,31 +70,105 @@ index fab8c85..acde260 100644
        /* If we managed to load dxcompiler.dll, but either don't find
         * DxcCreateInstance, or fail to create IDxcLibrary or
 diff --git a/src/microsoft/vulkan/dzn_cmd_buffer.c b/src/microsoft/vulkan/dzn_cmd_buffer.c
-index fd85f88..0e8417f 100644
+index fd85f88..1b88443 100644
 --- a/src/microsoft/vulkan/dzn_cmd_buffer.c
 +++ b/src/microsoft/vulkan/dzn_cmd_buffer.c
-@@ -1069,6 +1069,41 @@ dzn_cmd_buffer_gather_queries(struct dzn_cmd_buffer *cmdbuf)
+@@ -718,8 +718,25 @@ dzn_BeginCommandBuffer(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(dzn_cmd_buffer, cmdbuf, commandBuffer);
+    vk_command_buffer_begin(&cmdbuf->vk, info);
+-   if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY)
++   if (cmdbuf->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+       ID3D12GraphicsCommandList1_Reset(cmdbuf->cmdlist, cmdbuf->cmdalloc, NULL);
++      /* ⚠ Reset() con un estado inicial nulo deja el command list SIN pipeline, sin root
++       * signature y sin descriptor heaps, pero el estado que dzn lleva aparte sobrevivia a la
++       * grabacion anterior de este mismo command buffer. Como update_pipeline solo llama a
++       * SetPipelineState cuando el PSO cambia respecto al que cree atado, un command buffer
++       * reutilizado que vuelve a grabar el mismo dibujo se queda sin ponerlo: D3D12 avisa con
++       * «No pipeline state has been set in this command list. The runtime will use a default
++       * no-op pipeline state» y el dibujo no pinta nada, sin error y sin que nadie se entere.
++       *
++       * Se ve donde cada dibujo va en su propia tanda, que es lo que hace falta en una Xbox
++       * (TTT2_SUBMIT_EVERY=1): los command buffers rotan, cada uno vuelve a grabar el mismo
++       * dibujo del fotograma siguiente con el mismo PSO, y ese dibujo deja de pintar siempre.
++       * En Vulkan un command buffer que empieza a grabarse no hereda ningun estado, asi que lo
++       * correcto es partir de cero, igual que hace dzn_cmd_buffer_reset(). */
++      memset(&cmdbuf->state, 0, sizeof(cmdbuf->state));
++      cmdbuf->state.multiview.num_views = 1;
++      cmdbuf->state.multiview.view_mask = 1;
++   }
+    return vk_command_buffer_get_record_result(&cmdbuf->vk);
+ }
+ 
+@@ -1069,6 +1086,88 @@ dzn_cmd_buffer_gather_queries(struct dzn_cmd_buffer *cmdbuf)
     return VK_SUCCESS;
  }
  
 +/* Close() no dice que comando rechazo. El InfoQueue del dispositivo si, siempre que la capa
-+ * de depuracion este encendida (DZN_DEBUG=d3d12). */
++ * de depuracion este encendida (DZN_DEBUG=d3d12).
++ *
++ * ⚠ Con DZN_DUMP_MESSAGES=1 esto se vuelca en CADA cierre de command list, no solo cuando
++ * Close() falla: un dibujo puede ser aceptado y aun asi no pintar, y entonces lo unico que lo
++ * explica son los avisos de la capa de depuracion, que hasta ahora se tiraban sin leerlos.
++ * Pensado para usarse con un dibujo por tanda (TTT2_SUBMIT_EVERY=1 en el juego): asi cada
++ * aviso queda al lado del dibujo que lo provoco. */
++static bool
++dzn_volcar_siempre(void)
++{
++   static int si = -1;
++   if (si < 0) {
++      const char *v = getenv("DZN_DUMP_MESSAGES");
++      si = v != NULL && *v == '1';
++   }
++   return si != 0;
++}
++
++/* ⚠ DZN_TRACE_DRAWS=N: las primeras N lineas con lo que D3D12 recibe de verdad —que destinos
++ * se atan y con que tamaño, cuantos vertices lleva cada dibujo—, para cazar un dibujo que
++ * Vulkan acepta y que aun asi no pinta. El tope evita enterrar el registro: un fotograma del
++ * juego son cuatrocientos dibujos. */
++static unsigned
++dzn_tope_traza(void)
++{
++   static int n = -1;
++   if (n < 0) {
++      const char *v = getenv("DZN_TRACE_DRAWS");
++      n = v != NULL ? atoi(v) : 0;
++   }
++   return n > 0 ? (unsigned)n : 0u;
++}
++
++static unsigned dzn_lineas_trazadas = 0;
++
++#define DZN_TRAZA(...)                                                  \
++   do {                                                                 \
++      if (dzn_tope_traza() && dzn_lineas_trazadas < dzn_tope_traza()) { \
++         ++dzn_lineas_trazadas;                                         \
++         fprintf(stderr, __VA_ARGS__);                                  \
++         fflush(stderr);                                                \
++      }                                                                 \
++   } while (0)
++
 +static void
 +dzn_cmd_buffer_dump_messages(struct dzn_cmd_buffer *cmdbuf, HRESULT hres)
 +{
 +   struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
++   const bool fallo = FAILED(hres);
 +
-+   fprintf(stderr, "dzn: ID3D12GraphicsCommandList::Close = 0x%08lx\n", (unsigned long)hres);
++   if (fallo)
++      fprintf(stderr, "dzn: ID3D12GraphicsCommandList::Close = 0x%08lx\n", (unsigned long)hres);
 +
 +   ID3D12InfoQueue *iq = NULL;
 +   if (FAILED(ID3D12Device4_QueryInterface(device->dev, &IID_ID3D12InfoQueue, (void **)&iq))) {
-+      fprintf(stderr, "dzn: sin InfoQueue; arranca con DZN_DEBUG=d3d12 para saber el motivo\n");
-+      fflush(stderr);
++      if (fallo) {
++         fprintf(stderr, "dzn: sin InfoQueue; arranca con DZN_DEBUG=d3d12 para saber el motivo\n");
++         fflush(stderr);
++      }
 +      return;
 +   }
 +
 +   const UINT64 n = ID3D12InfoQueue_GetNumStoredMessages(iq);
-+   if (n == 0)
++   if (n == 0 && fallo)
 +      fprintf(stderr, "dzn: el InfoQueue esta vacio: la capa de depuracion esta apagada\n");
 +   for (UINT64 i = 0; i < n; i++) {
 +      SIZE_T len = 0;
@@ -115,7 +189,7 @@ index fd85f88..0e8417f 100644
  VKAPI_ATTR VkResult VKAPI_CALL
  dzn_EndCommandBuffer(VkCommandBuffer commandBuffer)
  {
-@@ -1078,8 +1113,10 @@ dzn_EndCommandBuffer(VkCommandBuffer commandBuffer)
+@@ -1078,8 +1177,12 @@ dzn_EndCommandBuffer(VkCommandBuffer commandBuffer)
        dzn_cmd_buffer_gather_events(cmdbuf);
        dzn_cmd_buffer_gather_queries(cmdbuf);
        HRESULT hres = ID3D12GraphicsCommandList1_Close(cmdbuf->cmdlist);
@@ -123,11 +197,80 @@ index fd85f88..0e8417f 100644
 +      if (FAILED(hres)) {
 +         dzn_cmd_buffer_dump_messages(cmdbuf, hres);
           vk_command_buffer_set_error(&cmdbuf->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++      } else if (dzn_volcar_siempre()) {
++         dzn_cmd_buffer_dump_messages(cmdbuf, hres);
 +      }
     }
  
     return vk_command_buffer_end(&cmdbuf->vk);
-@@ -3245,8 +3282,16 @@ dzn_cmd_buffer_update_pipeline(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint
+@@ -3185,12 +3288,16 @@ dzn_cmd_buffer_update_pipeline(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint
+ {
+    const struct dzn_pipeline *pipeline = cmdbuf->state.bindpoint[bindpoint].pipeline;
+ 
+-   if (!pipeline)
++   if (!pipeline) {
++      DZN_TRAZA("dzn: update_pipeline(bindpoint %u): SIN pipeline atado en este command buffer\n",
++                bindpoint);
+       return;
++   }
+ 
+    struct dzn_device *device = container_of(cmdbuf->vk.base.device, struct dzn_device, vk);
+-   ID3D12PipelineState *old_pipeline_state =
+-      cmdbuf->state.pipeline ? cmdbuf->state.pipeline->state : NULL;
++   /* ⚠ Lo que se compara es el PSO realmente atado, no `cmdbuf->state.pipeline->state`: con
++    * variantes ese campo es NULL y la comparacion daba siempre «no ha cambiado». */
++   ID3D12PipelineState *old_pipeline_state = cmdbuf->state.pipeline_state;
+ 
+    uint32_t view_instance_mask = 0;
+    if (cmdbuf->state.bindpoint[bindpoint].dirty & DZN_CMD_BINDPOINT_DIRTY_PIPELINE) {
+@@ -3226,7 +3333,6 @@ dzn_cmd_buffer_update_pipeline(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint
+          struct dzn_graphics_pipeline *gfx =
+             (struct dzn_graphics_pipeline *)pipeline;
+          ID3D12GraphicsCommandList1_IASetPrimitiveTopology(cmdbuf->cmdlist, gfx->ia.topology);
+-         dzn_graphics_pipeline_get_state(gfx, &cmdbuf->state.pipeline_variant);
+          if (gfx->multiview.native_view_instancing)
+             view_instance_mask = gfx->multiview.view_mask;
+          else
+@@ -3237,16 +3343,51 @@ dzn_cmd_buffer_update_pipeline(struct dzn_cmd_buffer *cmdbuf, uint32_t bindpoint
+       }
+    }
+ 
+-   ID3D12PipelineState *new_pipeline_state = pipeline->state;
+-
+-   if (old_pipeline_state != new_pipeline_state) {
+-      ID3D12GraphicsCommandList1_SetPipelineState(cmdbuf->cmdlist, pipeline->state);
++   /* ⚠⚠ El PSO de un pipeline grafico sale de dzn_graphics_pipeline_get_state(), que resuelve
++    * —y crea si hace falta— la variante que toca para el estado actual. Aqui se llamaba sin
++    * recoger lo que devuelve y luego se usaba `pipeline->state`, que **vale NULL en cuanto el
++    * pipeline tiene variantes**. Con NULL a los dos lados de la comparacion, SetPipelineState
++    * no se llegaba a llamar nunca y el command list se quedaba sin pipeline: D3D12 avisa con
++    * «No pipeline state has been set in this command list. The runtime will use a default
++    * no-op pipeline state» y el dibujo no pinta nada, sin error ni mas sintoma.
++    *
++    * Hay variantes justo donde el hardware no tiene el estado dinamico del caso —depth bias
++    * sin options16.DynamicDepthBiasSupported, el estado de stencil, el corte de tira de
++    * indices—, que es lo que pasa en una Xbox Series X y no en una GPU de escritorio: de ahi
++    * que el mismo juego, con el mismo Dozen, dibuje en el PC y no en la consola. */
++   ID3D12PipelineState *new_pipeline_state =
++      bindpoint == VK_PIPELINE_BIND_POINT_GRAPHICS ?
++      dzn_graphics_pipeline_get_state((struct dzn_graphics_pipeline *)pipeline,
++                                      &cmdbuf->state.pipeline_variant) :
++      pipeline->state;
++
++   DZN_TRAZA("dzn: update_pipeline(bindpoint %u): dirty 0x%x, pso viejo %p, pso nuevo %p, "
++             "variantes %s -> %s\n",
++             bindpoint, cmdbuf->state.bindpoint[bindpoint].dirty, (void *)old_pipeline_state,
++             (void *)new_pipeline_state,
++             bindpoint == VK_PIPELINE_BIND_POINT_GRAPHICS &&
++                   ((const struct dzn_graphics_pipeline *)pipeline)->variants ? "si" : "no",
++             new_pipeline_state == NULL ? "NO SE ATA (pso nulo)"
++             : old_pipeline_state == new_pipeline_state ? "no se ata (ya estaba)"
++                                                        : "SetPipelineState");
++
++   if (new_pipeline_state && old_pipeline_state != new_pipeline_state) {
++      ID3D12GraphicsCommandList1_SetPipelineState(cmdbuf->cmdlist, new_pipeline_state);
+       cmdbuf->state.pipeline = pipeline;
++      cmdbuf->state.pipeline_state = new_pipeline_state;
     }
  
     /* Deferring this until after the pipeline has been set due to an NVIDIA driver bug
@@ -146,7 +289,7 @@ index fd85f88..0e8417f 100644
        ID3D12GraphicsCommandList1_SetViewInstanceMask(cmdbuf->cmdlist, view_instance_mask);
  }
  
-@@ -3460,7 +3505,11 @@ dzn_cmd_buffer_update_viewports(struct dzn_cmd_buffer *cmdbuf)
+@@ -3460,7 +3601,11 @@ dzn_cmd_buffer_update_viewports(struct dzn_cmd_buffer *cmdbuf)
     const struct dzn_graphics_pipeline *pipeline =
        (const struct dzn_graphics_pipeline *)cmdbuf->state.pipeline;
  
@@ -159,7 +302,7 @@ index fd85f88..0e8417f 100644
         !pipeline->vp.count)
        return;
  
-@@ -3473,7 +3522,7 @@ dzn_cmd_buffer_update_scissors(struct dzn_cmd_buffer *cmdbuf)
+@@ -3473,7 +3618,7 @@ dzn_cmd_buffer_update_scissors(struct dzn_cmd_buffer *cmdbuf)
     const struct dzn_graphics_pipeline *pipeline =
        (const struct dzn_graphics_pipeline *)cmdbuf->state.pipeline;
  
@@ -168,7 +311,7 @@ index fd85f88..0e8417f 100644
        return;
  
     if (!pipeline->scissor.count) {
-@@ -3719,6 +3768,15 @@ dzn_cmd_buffer_triangle_fan_rewrite_index(struct dzn_cmd_buffer *cmdbuf,
+@@ -3719,6 +3864,15 @@ dzn_cmd_buffer_triangle_fan_rewrite_index(struct dzn_cmd_buffer *cmdbuf,
        cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_COMPUTE].dirty |=
           DZN_CMD_BINDPOINT_DIRTY_PIPELINE;
     }
@@ -184,7 +327,7 @@ index fd85f88..0e8417f 100644
  
     cmdbuf->state.ib.view.SizeInBytes = *index_count * 4;
     cmdbuf->state.ib.view.BufferLocation = ID3D12Resource_GetGPUVirtualAddress(new_index_buf);
-@@ -4005,6 +4063,15 @@ dzn_cmd_buffer_patch_indirect_draw(struct dzn_cmd_buffer *cmdbuf,
+@@ -4005,6 +4159,15 @@ dzn_cmd_buffer_patch_indirect_draw(struct dzn_cmd_buffer *cmdbuf,
        cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_COMPUTE].dirty |=
           DZN_CMD_BINDPOINT_DIRTY_PIPELINE;
     }
@@ -200,6 +343,37 @@ index fd85f88..0e8417f 100644
  
     *inout_draw_buf = exec_buf;
     *inout_draw_buf_offset = exec_buf_draw_offset;
+@@ -5002,6 +5165,21 @@ dzn_CmdBeginRendering(VkCommandBuffer commandBuffer,
+                                                  pRenderingInfo->colorAttachmentCount ? rt_handles : NULL,
+                                                  false, zs_handle.ptr ? &zs_handle : NULL);
+ 
++   if (dzn_tope_traza()) {
++      uint32_t aw = 0, ah = 0;
++      if (pRenderingInfo->colorAttachmentCount > 0 && pRenderingInfo->pColorAttachments[0].imageView) {
++         VK_FROM_HANDLE(dzn_image_view, iv0, pRenderingInfo->pColorAttachments[0].imageView);
++         aw = iv0->vk.image->extent.width;
++         ah = iv0->vk.image->extent.height;
++      }
++      DZN_TRAZA("dzn: pase: area %ux%u en %d,%d; %u color (rtv0 %p, imagen %ux%u), dsv %s\n",
++                pRenderingInfo->renderArea.extent.width, pRenderingInfo->renderArea.extent.height,
++                pRenderingInfo->renderArea.offset.x, pRenderingInfo->renderArea.offset.y,
++                pRenderingInfo->colorAttachmentCount,
++                pRenderingInfo->colorAttachmentCount ? (void *)(uintptr_t)rt_handles[0].ptr : NULL, aw, ah,
++                zs_handle.ptr ? "si" : "no");
++   }
++
+    for (uint32_t a = 0; a < pRenderingInfo->colorAttachmentCount; a++) {
+       const VkRenderingAttachmentInfo *att = &pRenderingInfo->pColorAttachments[a];
+       VK_FROM_HANDLE(dzn_image_view, iview, att->imageView);
+@@ -5317,6 +5495,8 @@ dzn_CmdDraw(VkCommandBuffer commandBuffer,
+          cmdbuf->state.bindpoint[VK_PIPELINE_BIND_POINT_GRAPHICS].dirty |=
+             DZN_CMD_BINDPOINT_DIRTY_SYSVALS;
+          dzn_cmd_buffer_prepare_draw(cmdbuf, false);
++         DZN_TRAZA("dzn: draw %u vertices, %u instancias, primera %u; pso %p, mascara de vista 0x%x\n",
++                   vertexCount, instanceCount, firstVertex, (void *)pipeline, view_mask);
+          ID3D12GraphicsCommandList1_DrawInstanced(cmdbuf->cmdlist, vertexCount, instanceCount,
+                                           firstVertex, firstInstance);
+       }
 diff --git a/src/microsoft/vulkan/dzn_device.c b/src/microsoft/vulkan/dzn_device.c
 index 4a4dde5..7503f16 100644
 --- a/src/microsoft/vulkan/dzn_device.c
@@ -377,6 +551,48 @@ index b67d131..3ca641f 100644
     pMemoryRequirements->memoryRequirements = (VkMemoryRequirements) {
        .size = info.SizeInBytes,
        .alignment = info.Alignment,
+diff --git a/src/microsoft/vulkan/dzn_pipeline.c b/src/microsoft/vulkan/dzn_pipeline.c
+index 65ccc0e..99c13c7 100644
+--- a/src/microsoft/vulkan/dzn_pipeline.c
++++ b/src/microsoft/vulkan/dzn_pipeline.c
+@@ -420,11 +420,17 @@ dzn_pipeline_compile_shader(struct dzn_device *device,
+       container_of(device->vk.physical, struct dzn_physical_device, vk);
+    struct nir_to_dxil_options opts = {
+       .environment = DXIL_ENVIRONMENT_VULKAN,
+-      .lower_int16 = !pdev->options4.Native16BitShaderOpsSupported &&
+-      /* Don't lower 16-bit types if they can only come from min-precision */
+-         (device->vk.enabled_extensions.KHR_shader_float16_int8 ||
+-          device->vk.enabled_features.shaderFloat16 ||
+-          device->vk.enabled_features.shaderInt16),
++      /* ⚠⚠ Si el hardware no tiene operaciones nativas de 16 bits, se bajan SIEMPRE. La
++       * condicion de arriba —bajarlos solo si la aplicacion pidio float16/int16— da por hecho
++       * que, sin esas features, los 16 bits solo pueden venir de min-precision, que DXIL sabe
++       * representar. No es cierto: un SPIR-V puede traer tipos de 16 bits de verdad igualmente,
++       * y entonces CreateVertexShader los rechaza con
++       *     «Shader uses native 16bit ops, but the device does not support this»
++       * la creacion del PSO falla, dzn_graphics_pipeline_get_state() devuelve NULL, nadie llama
++       * a SetPipelineState y el dibujo sale no-op: no pinta, sin error ni rastro en Vulkan.
++       * En una Xbox Series X eso dejaba el escenario del juego en negro mientras el resto de la
++       * pantalla —los dibujos cuyos shaders no usan 16 bits— se veia bien. */
++      .lower_int16 = !pdev->options4.Native16BitShaderOpsSupported,
+       .shader_model_max = dzn_get_shader_model(pdev),
+       .input_clip_size = input_clip_size,
+       .advanced_texture_ops = pdev->options14.AdvancedTextureOpsSupported,
+diff --git a/src/microsoft/vulkan/dzn_private.h b/src/microsoft/vulkan/dzn_private.h
+index 9b1f5ab..1832173 100644
+--- a/src/microsoft/vulkan/dzn_private.h
++++ b/src/microsoft/vulkan/dzn_private.h
+@@ -588,6 +588,10 @@ struct dzn_graphics_pipeline_variant {
+ 
+ struct dzn_cmd_buffer_state {
+    const struct dzn_pipeline *pipeline;
++   /* ⚠ El PSO que de verdad se ato en el command list. No basta con `pipeline->state`: un
++    * pipeline con variantes lo tiene a NULL y el bueno sale de dzn_graphics_pipeline_get_state().
++    * Ver dzn_cmd_buffer_update_pipeline(). */
++   ID3D12PipelineState *pipeline_state;
+    struct dzn_descriptor_heap *heaps[NUM_POOL_TYPES];
+    struct dzn_graphics_pipeline_variant_key pipeline_variant;
+    struct {
 diff --git a/src/vulkan/runtime/vk_log.c b/src/vulkan/runtime/vk_log.c
 index 2442219..9fa196d 100644
 --- a/src/vulkan/runtime/vk_log.c

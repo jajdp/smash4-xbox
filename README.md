@@ -14,11 +14,12 @@ This is an honest status, not a trailer. Dates are when each line was measured.
 |---|---|
 | **PC, Vulkan on an NVIDIA GPU** | **Plays, 59.9 FPS.** This is Smash4PC doing its job; the port changes nothing here |
 | **PC, Vulkan on Direct3D 12** (Mesa's Dozen) | **Boots, draws, reaches the attract demo.** Slow — tens of FPS at best, and after a few minutes it runs out of descriptor pools and stops (2026-11-04) |
-| **Xbox Series X, Developer Mode** | **Draws.** Title screen, main menu and the attract demo, on a television (2026-11-04). With `TTT2_SUBMIT_EVERY=1`, which costs one submission per draw and holds it at ~15 FPS; without it the process is killed for memory. Menus come out with the same sprite repeated four times |
+| **Xbox Series X, Developer Mode** | **Draws, and draws everything** (2026-11-05): title screen, main menu, the attract demo **with its stage** and the fight itself, on a television, at **23-32 FPS**. No crutch needed any more: 16 submissions per frame, clean menus, and the stage no longer comes out black |
 
-So: it draws, it reaches the menu, and it plays its own demo — but it is held together by a
-submission per draw, and the menus have ghosting. If you are here for a finished port, it is not
-one yet. [Issues](../../issues) says what is left and what each thing would take.
+So: it draws, it reaches the menu, and it plays its own demo in full on a television, with no
+crutches left. If you are here for a finished port, it is not one yet: performance is 23-32 FPS,
+not 60, and plenty is still untested, starting with a long session on a controller.
+[Issues](../../issues) says what is left and what each thing would take.
 
 ## Which console this was tested on
 

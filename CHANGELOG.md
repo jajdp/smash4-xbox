@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.0 — 2026-11-05
+
+The console draws **everything**, and without a crutch: title screen, main menu, the attract
+demo **with its stage** and the fight itself, at **23-32 FPS** and 16 submissions per frame.
+The black stage and the four-times-repeated menu sprite were the same bug, and both are gone.
+
+**Mesa (`patches/mesa-dozen-xbox.patch`)**
+
+* **16-bit types were not lowered where the hardware has no native 16-bit ops.** The condition
+  in `dzn_pipeline.c` only lowered them if the application had asked for `float16`/`int16`,
+  assuming that otherwise they could only come from min-precision. They cannot: a SPIR-V may
+  carry real 16-bit types anyway, `CreateVertexShader` then rejects the shader — *"Shader uses
+  native 16bit ops, but the device does not support this"* —, **creating the variant's PSO
+  fails**, `dzn_graphics_pipeline_get_state()` returns NULL, nobody calls `SetPipelineState()`
+  and D3D12 runs the draw with a **default no-op pipeline state**: it paints nothing, with no
+  error and no trace on the Vulkan side. Measured on the console: 23 of 40 traced draws had no
+  PSO. A desktop GPU reports `Native16BitShaderOpsSupported`, which is why the same game with
+  the same Dozen drew on a PC and not on the Xbox.
+  Fix: `.lower_int16 = !pdev->options4.Native16BitShaderOpsSupported`.
+* `dzn_cmd_buffer_update_pipeline()` called `dzn_graphics_pipeline_get_state()` **without using
+  its return value** and then compared and bound `pipeline->state`, which is NULL as soon as the
+  pipeline has variants. The PSO actually bound is now kept in `cmdbuf->state.pipeline_state`.
+* `dzn_BeginCommandBuffer()` did not clear `cmdbuf->state`, although `Reset(…, NULL)` leaves the
+  command list with no pipeline, no root signature and no descriptor heaps.
+* `DZN_DUMP_MESSAGES=1` dumps the `ID3D12InfoQueue` at **every** command list close, not only
+  when `Close()` fails. A draw can be accepted and still paint nothing; the debug layer's
+  warnings are then the only thing that explains it. With one draw per batch, each warning lands
+  next to the draw that caused it. This is what found all of the above.
+
 ## 0.2.0 — 2026-11-04
 
 The console draws. Title screen, main menu and the attract demo, on a television. It is held up
@@ -40,7 +69,8 @@ from dump to picture is closed.
 
 | Variable | What it does |
 |---|---|
-| `TTT2_SUBMIT_EVERY=N` | Close the batch every N draws. `1` is what currently holds the console up |
+| `TTT2_SUBMIT_EVERY=N` | Close the batch every N draws. The console needed `1` until 0.3.0; now it is only a way to pin down the draw that hangs a GPU |
+| `DZN_DUMP_MESSAGES=1` | Dump the D3D12 debug layer's messages at every command list close, not only on failure (needs `DZN_DEBUG=d3d12`) |
 | `TTT2_GPU_TIMEOUT=seconds` | How long to wait for the GPU before calling it dead. Tells apart a hang from something absurdly slow |
 | `TTT2_NO_D16=1`, `TTT2_NO_4444=1` | Pretend the driver lacks those formats, to reproduce a console's behaviour on a PC |
 | `TTT2_TRACE_GUEST_SPAN=1` | How much of a guest region the GPU ever reads. Measured: 369 MiB of MEM2's gigabyte |
