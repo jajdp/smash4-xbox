@@ -29,6 +29,34 @@ The black stage and the four-times-repeated menu sprite were the same bug, and b
   warnings are then the only thing that explains it. With one draw per batch, each warning lands
   next to the draw that caused it. This is what found all of the above.
 
+**The game (`patches/smash4pc-xbox.patch`)** — regenerated: now **3,467 added lines over 45
+files** (was 2,281 over 35).
+
+* **The SPIR-V was compiled for Vulkan 1.3 even when the driver is 1.2.** In 1.3
+  `shaderDemoteToHelperInvocation` is core, so glslang translated `discard` into
+  `OpDemoteToHelperInvocation`, which the console's Dozen cannot compile: **191 shaders lost per
+  run, now zero**. It compiles for `properties.apiVersion`.
+* The translator emitted `demote` on every KILL and alpha test even though the runtime does not
+  use it; it emits `discard` now.
+* `TTT2_VS_FIJO` and `TTT2_PS_FIJO` never actually applied: the patch went in **after** the GLSL
+  hash was computed, so the already-compiled module and the SPIR-V cache skipped it, and the
+  patched shader was stored under the original's key, poisoning the cache. The patch now goes in
+  before the hash, so forced GLSL gets a key of its own. Without this there was no way to cut
+  the problem in half.
+* The file, event, audio and input traces were read into statically initialised globals, before
+  `uwp_entry` reads `entorno.txt`: they worked on the PC and never switched on at all on the
+  console. Now evaluated lazily.
+* The per-draw trace cost half the frame rate — one line per draw at ~4,500/s. It is behind
+  `TTT2_TRACE_EVERY_DRAW` now.
+
+New instruments, all of them written to chase a draw that is issued and paints nothing:
+`TTT2_TRACE_VB_ORIGEN` (who writes a vertex-buffer descriptor with a negative size, on the
+producer's side), `TTT2_TRACE_PAREJAS` (every distinct vertex/pixel shader pair that reaches a
+draw, which is how you aim `TTT2_VS_FIJO` without guessing a hash), `TTT2_TRACE_ESTADO_PS` (the
+full state that decides whether a draw covers pixels: viewport, scissor, masks, depth, target
+and pipeline key, and which draw of the frame it is) and `TTT2_TRACE_EN_PASE` (trace the frame
+that contains the pass, instead of timing it by hand with `TTT2_TRACE_AT`).
+
 ## 0.2.0 — 2026-11-04
 
 The console draws. Title screen, main menu and the attract demo, on a television. It is held up

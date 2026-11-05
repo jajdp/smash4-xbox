@@ -40,8 +40,8 @@ Direct3D 12.
 
 | Pieza | Qué es |
 |---|---|
-| `patches/smash4pc-xbox.patch` | **2.281 líneas añadidas en 35 archivos.** La reescritura del renderizador (abajo), el arranque UWP, el VFS de archivos partidos y el atajo de mando para el contador de FPS |
-| `patches/mesa-dozen-xbox.patch` | **199 líneas añadidas en 7 archivos.** Tres fallos reales de Mesa y un diagnóstico, los cuatro encontrados en la consola (abajo) |
+| `patches/smash4pc-xbox.patch` | **3.467 líneas añadidas en 45 archivos.** La reescritura del renderizador (abajo), el arranque UWP, el VFS de archivos partidos, el atajo de mando para el contador de FPS y las trazas que encontraron el escenario negro |
+| `patches/mesa-dozen-xbox.patch` | **409 líneas añadidas en 9 archivos.** Seis fallos reales de Mesa y dos diagnósticos, todos encontrados en la consola (abajo) |
 | `src/mesa_sysstubs.c` | Sustitutos de las funciones de escritorio que Dozen importa, para que `user32`, `gdi32` y `shell32` no entren nunca en la tabla de importaciones de `vulkan_dzn.dll` |
 | `src/mesa_uwp_compat.h` | Cabecera incluida a la fuerza: las grafías de `_Interlocked*` que clang-cl no declara, y la marca de UWP que lee el WSI |
 | `tools/compilar-dozen-uwp.ps1` | Compila Dozen para UWP: cross file, entorno `store` y `WindowsApp.lib` |
@@ -125,17 +125,28 @@ reescribió para no necesitarlas. La historia completa está en
    región se parte en **ventanas solapadas a la mitad** —un `VkBuffer` por ventana, todas sobre
    la misma asignación a distinto desplazamiento—. MEM2 sale en 16 ventanas.
 
-## Tres fallos de Mesa, encontrados en la consola
+## Seis fallos de Mesa, encontrados en la consola
 
-Los tres están en `patches/mesa-dozen-xbox.patch` y los tres merecen ir aguas arriba.
+Los seis están en `patches/mesa-dozen-xbox.patch` y los seis merecen ir aguas arriba. Los tres
+primeros impedían que el juego arrancara; los tres siguientes, que se dibujara el escenario.
 
 | Fallo | Qué pasa | Dónde |
 |---|---|---|
 | **`SetViewInstanceMask` donde no hay view instancing** | Dozen la llama en cada cambio de pipeline gráfico, haya máscara o no. Una máscara de `1` es la vista única por omisión, así que la llamada no hace nada —salvo en cualquier GPU de AMD, donde el tier es `NOT_SUPPORTED`: el runtime la rechaza, el command list queda en estado de error y `Close()` falla. `vkEndCommandBuffer` devuelve entonces `VK_ERROR_OUT_OF_HOST_MEMORY` y **no se dibuja nada**. `dzn_pipeline.c` ya hace esa comprobación; el command buffer no | `dzn_cmd_buffer.c` |
 | **El WSI de Win32 necesita una ventana de escritorio** | Presenta por DirectComposition: `CreateSwapChainForComposition` y después `IDCompositionDevice::CreateTargetForHwnd`. En UWP no hay HWND de escritorio —lo que la superficie guarda es una CoreWindow— y `vkCreateSwapchainKHR` devuelve `VK_ERROR_INITIALIZATION_FAILED`. La salida es `CreateSwapChainForCoreWindow`, que presenta por sí misma | `wsi_common_win32.cpp` |
 | **`DXIL.dll` se carga con `LoadLibrary`** | Dentro de un App Container eso no encuentra una DLL del paquete, y además la grafía tiene que coincidir exactamente con el archivo. Sin el validador, `vkCreateInstance` falla sin explicar nada | `dxil_validator.cpp`, `dzn_dxgi.c` |
+| **Los tipos de 16 bits solo se bajan si la aplicación los pidió** | La condición es `!Native16BitShaderOpsSupported && (KHR_shader_float16_int8 activada \|\| shaderFloat16 \|\| shaderInt16)`, dando por hecho que sin esas features los tipos de 16 bits solo pueden venir de min-precision. No es cierto: el SPIR-V los trae igualmente. `CreateVertexShader` rechaza entonces el shader (*«Shader uses native 16bit ops, but the device does not support this»*), falla la creación del PSO de la variante, `dzn_graphics_pipeline_get_state()` devuelve **NULL**, nadie llama a `SetPipelineState` y Direct3D 12 ejecuta el dibujo con un **pipeline no-op: no pinta nada, sin error y sin rastro del lado de Vulkan**. Medido en la consola: **23 de 40** dibujos trazados se quedaban sin PSO. Una GPU de escritorio sí reporta `Native16BitShaderOpsSupported`, y por eso el mismo Dozen dibuja el escenario en un PC y no en la consola | `dzn_pipeline.c` |
+| **El PSO que construye una variante del pipeline nunca se ata** | `dzn_cmd_buffer_update_pipeline()` llama a `dzn_graphics_pipeline_get_state()` **sin recoger lo que devuelve**, y luego compara y ata `pipeline->state`, que es NULL en cuanto el pipeline tiene variantes. El PSO realmente atado se guarda ahora en `cmdbuf->state.pipeline_state` | `dzn_cmd_buffer.c` |
+| **`vkBeginCommandBuffer` no limpia el estado del command buffer** | `Reset(cmdlist, cmdalloc, NULL)` deja el command list sin pipeline, sin root signature y sin descriptor heaps, pero Dozen conserva su estado en caché. En Vulkan, un command buffer que empieza a grabarse no hereda nada | `dzn_cmd_buffer.c` |
 
-Y un diagnóstico que no es un fallo pero ahorró días: `GetResourceAllocationInfo` devuelve
+Y un segundo diagnóstico, que es justo lo que encontró los tres de arriba: **`DZN_DUMP_MESSAGES=1`**
+vuelca el `ID3D12InfoQueue` en *cada* cierre de command list y no solo cuando `Close()` falla, y
+**`DZN_TRACE_DRAWS=N`** imprime una línea por dibujo, por apertura de pase y por
+`update_pipeline`. Un dibujo puede ser aceptado y aun así no pintar nada; cuando pasa eso, los
+avisos de la capa de depuración son lo único que lo explica, y con un dibujo por tanda cada aviso
+queda al lado del dibujo que lo provocó.
+
+Y un diagnóstico más, que no es un fallo pero ahorró días: `GetResourceAllocationInfo` devuelve
 `SizeInBytes = UINT64_MAX` cuando Direct3D 12 rechaza un recurso, y Dozen lo copia tal cual a
 `VkMemoryRequirements::size`, así que la aplicación intenta reservar
 18.446.744.073.709.551.615 bytes y se cae. El parche imprime la descripción del recurso
@@ -156,9 +167,10 @@ $env:MESA_TRACE_ERRORS = '1'      # cada error de Mesa dice en qué archivo y l�
 $env:DZN_DEBUG = 'd3d12'          # la capa de depuración de D3D12; el parche vuelca su InfoQueue
 ```
 
-Dos de los tres fallos de arriba salieron así en minutos. El tercero —el view instancing— solo
-aparece en hardware de AMD, y por eso el volcado del InfoQueue de D3D12 tenía que funcionar **en
-la consola**; funciona.
+Los dos primeros fallos de arriba salieron así en minutos. El del view instancing solo aparece
+en hardware de AMD, y por eso el volcado del InfoQueue de D3D12 tenía que funcionar **en la
+consola**; funciona. Los tres del escenario negro —los 16 bits, el PSO sin atar y el estado sin
+limpiar— no se podían ver de otra forma: ahí el dibujo se aceptaba sin un solo error.
 
 En la consola no hay línea de órdenes, así que `LocalState\Smash4\entorno.txt` fija variables de
 entorno, una `CLAVE=valor` por línea, y se sube en segundos con `tools\xbox-portal.ps1 subir`.
